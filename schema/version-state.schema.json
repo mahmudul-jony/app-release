@@ -53,7 +53,8 @@
                   "apk_download_url": { "type": ["string", "null"] },
                   "sha256_download_url": { "type": ["string", "null"] },
                   "commit_sha": { "type": ["string", "null"] },
-                  "published_at": { "type": ["string", "null"] }
+                  "published_at": { "type": ["string", "null"] },
+                  "run_id": { "type": ["string", "null"] }
                 }
               },
               "development": {
@@ -67,8 +68,52 @@
                   "apk_download_url": { "type": ["string", "null"] },
                   "sha256_download_url": { "type": ["string", "null"] },
                   "commit_sha": { "type": ["string", "null"] },
-                  "published_at": { "type": ["string", "null"] }
+                  "published_at": { "type": ["string", "null"] },
+                  "run_id": { "type": ["string", "null"] }
                 }
+              }
+            }
+          },
+          "active_reservation": {
+            "type": ["object", "null"]
+          },
+          "reservations": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "reservation_id",
+                "run_id",
+                "app_id",
+                "channel",
+                "branch",
+                "version_name",
+                "build_number",
+                "status",
+                "reserved_at"
+              ],
+              "properties": {
+                "reservation_id": { "type": "string" },
+                "run_id": { "type": "string" },
+                "run_attempt": { "type": "integer" },
+                "app_id": { "type": "string" },
+                "channel": { "type": "string" },
+                "is_prerelease": { "type": "boolean" },
+                "branch": { "type": "string" },
+                "version_name": { "type": "string" },
+                "build_number": { "type": "integer" },
+                "version_full": { "type": "string" },
+                "release_tag": { "type": "string" },
+                "release_title": { "type": "string" },
+                "apk_asset_name": { "type": "string" },
+                "metadata_asset_name": { "type": "string" },
+                "commit_sha": { "type": ["string", "null"] },
+                "reserved_at": { "type": "string" },
+                "status": {
+                  "type": "string",
+                  "enum": ["reserved", "published", "failed", "cancelled"]
+                },
+                "updated_at": { "type": "string" }
               }
             }
           },
@@ -81,7 +126,8 @@
               "version_name": { "type": ["string", "null"] },
               "build_number": { "type": ["integer", "null"] },
               "release_tag": { "type": ["string", "null"] },
-              "built_at": { "type": ["string", "null"] }
+              "built_at": { "type": ["string", "null"] },
+              "status": { "type": ["string", "null"] }
             }
           }
         }

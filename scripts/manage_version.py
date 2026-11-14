@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
-Centralized Version & Channel Management Script for Multi-Application Flutter APK Releases.
+Centralized Version, Channel & Build Number Reservation Management.
 
-Supports:
-  1. Managing central version state for multiple applications.
-  2. Distinct release channels:
+Handles:
+  1. Atomic build-number reservation and persistence BEFORE builds start.
+  2. Strict monotonic increase: reserved build numbers are NEVER reused or decreased.
+  3. Channel separation:
      - 'main' branch        -> 'production' channel (prerelease: false)
      - 'development' branch -> 'development' channel (prerelease: true)
-  3. Strict version progression rules:
+  4. Version progression rules:
      - 'development': patch version +1, build number +1
      - 'main'       : version name unchanged, build number +1
-  4. Monotonic build number enforcement (Android versionCode must always increase).
-  5. Applying versions to fetched source pubspec.yaml in runner memory (never committed to source repo).
-  6. Generating machine-readable release-metadata.json for unauthenticated client discovery.
-  7. Recording channel releases in central state after successful publication.
+  5. Multi-application safe state persistence with reservation audit history.
+  6. Finalization of successful releases into channel metadata.
+  7. Recording failure/cancellation without releasing reserved build numbers.
+  8. Applying versions to fetched source pubspec.yaml in runner memory.
+  9. Generating machine-readable public release-metadata.json.
 """
 
 from __future__ import annotations
@@ -26,9 +28,10 @@ import os
 from pathlib import Path
 import re
 import sys
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 CENTRAL_REPO = "mahmudul-jony/app-release"
+MAX_RESERVATIONS_HISTORY = 50
 
 
 def parse_semver(version_str: str) -> Tuple[int, int, int]:
@@ -139,8 +142,11 @@ def write_github_output(outputs: Dict[str, str]) -> None:
                 f.write(f"{key}={val}\n")
 
 
-def cmd_calculate(args: argparse.Namespace) -> None:
-    """Calculate next version, identify channel, and export workflow outputs."""
+def cmd_reserve(args: argparse.Namespace) -> Dict[str, Any]:
+    """
+    Atomically reserve and persist the next build number and version in central state.
+    Once reserved, the build number will NEVER be reused, even if builds fail or cancel.
+    """
     state_path = Path(args.state_file).resolve()
     data = load_state(state_path)
 
@@ -151,11 +157,44 @@ def cmd_calculate(args: argparse.Namespace) -> None:
         )
 
     app_config = data["apps"][app_id]
-    current_ver = str(app_config.get("current_version_name", "1.0.0"))
-    current_build = int(app_config.get("current_build_number", 1))
-
     branch_clean = args.branch.strip().lower()
     channel, is_prerelease = resolve_channel(branch_clean)
+
+    run_id = str(args.run_id or os.getenv("GITHUB_RUN_ID", "manual-local"))
+    run_attempt = int(args.run_attempt or os.getenv("GITHUB_RUN_ATTEMPT", 1))
+
+    # 1. Idempotency check: if this run_id already reserved for this app, return existing reservation
+    existing_reservations = app_config.get("reservations", [])
+    for res in existing_reservations:
+        if res.get("run_id") == run_id and res.get("app_id") == app_id:
+            print(f"Existing reservation found for run_id={run_id}: reusing reservation {res['reservation_id']}")
+            outputs = {
+                "APP_ID": app_id,
+                "APP_NAME": app_config.get("app_name", args.app.title()),
+                "REPOSITORY": app_config.get("repository", f"mahmudul-jony/{args.app}"),
+                "PACKAGE_NAME": app_config.get("package_name", ""),
+                "VERSION_NAME": res["version_name"],
+                "BUILD_NUMBER": str(res["build_number"]),
+                "VERSION_CODE": str(res["build_number"]),
+                "VERSION_FULL": res["version_full"],
+                "CHANNEL": res["channel"],
+                "IS_PRERELEASE": "true" if res.get("is_prerelease", is_prerelease) else "false",
+                "RELEASE_TAG": res["release_tag"],
+                "RELEASE_TITLE": res["release_title"],
+                "APK_ASSET_NAME": res["apk_asset_name"],
+                "METADATA_ASSET_NAME": res["metadata_asset_name"],
+                "RESERVATION_ID": res["reservation_id"],
+                "SOURCE_BRANCH": branch_clean,
+                "FLUTTER_VERSION": str(app_config.get("flutter_version", "3.41.9")),
+                "FLUTTER_CHANNEL": str(app_config.get("flutter_channel", "stable")),
+                "JAVA_VERSION": str(app_config.get("java_version", "17")),
+            }
+            write_github_output(outputs)
+            return res
+
+    # 2. Calculate next version and build number
+    current_ver = str(app_config.get("current_version_name", "1.0.0"))
+    current_build = int(app_config.get("current_build_number", 1))
 
     next_ver, next_build = calculate_next_version(current_ver, current_build, branch_clean)
 
@@ -171,6 +210,45 @@ def cmd_calculate(args: argparse.Namespace) -> None:
     release_title = f"{app_name} v{version_full} ({channel.title()})"
     apk_asset_name = f"{app_id}-v{version_full}-{channel}.apk"
     metadata_asset_name = f"{app_id}-v{version_full}-{channel}-metadata.json"
+    reservation_id = f"{app_id}-b{next_build}-run{run_id}"
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    reservation = {
+        "reservation_id": reservation_id,
+        "run_id": run_id,
+        "run_attempt": run_attempt,
+        "app_id": app_id,
+        "channel": channel,
+        "is_prerelease": is_prerelease,
+        "branch": branch_clean,
+        "version_name": next_ver,
+        "build_number": next_build,
+        "version_full": version_full,
+        "release_tag": release_tag,
+        "release_title": release_title,
+        "apk_asset_name": apk_asset_name,
+        "metadata_asset_name": metadata_asset_name,
+        "commit_sha": args.commit_sha or None,
+        "reserved_at": now_iso,
+        "status": "reserved",
+        "updated_at": now_iso,
+    }
+
+    # 3. Persist reservation into state immediately before any build starts
+    app_config["current_version_name"] = next_ver
+    app_config["current_build_number"] = next_build
+    app_config["updated_at"] = now_iso
+    app_config["active_reservation"] = reservation
+
+    if "reservations" not in app_config or not isinstance(app_config["reservations"], list):
+        app_config["reservations"] = []
+
+    app_config["reservations"].append(reservation)
+    if len(app_config["reservations"]) > MAX_RESERVATIONS_HISTORY:
+        app_config["reservations"] = app_config["reservations"][-MAX_RESERVATIONS_HISTORY:]
+
+    save_state(state_path, data)
 
     outputs = {
         "APP_ID": app_id,
@@ -191,6 +269,7 @@ def cmd_calculate(args: argparse.Namespace) -> None:
         "RELEASE_TITLE": release_title,
         "APK_ASSET_NAME": apk_asset_name,
         "METADATA_ASSET_NAME": metadata_asset_name,
+        "RESERVATION_ID": reservation_id,
         "SOURCE_BRANCH": branch_clean,
         "FLUTTER_VERSION": str(flutter_version),
         "FLUTTER_CHANNEL": str(flutter_channel),
@@ -202,20 +281,174 @@ def cmd_calculate(args: argparse.Namespace) -> None:
     if args.json:
         print(json.dumps(outputs, indent=2))
     else:
-        print(f"=== Central Release Calculation ===")
+        print(f"=== Central Build Number Reserved ===")
         print(f"Application Identifier : {app_id}")
         print(f"Application Name       : {app_name}")
+        print(f"Reservation ID         : {reservation_id}")
         print(f"Source Branch          : {branch_clean}")
         print(f"Release Channel        : {channel} (is_prerelease: {is_prerelease})")
-        print(f"Current Central State  : {current_ver}+{current_build}")
-        print(f"Calculated Version     : {version_full}")
+        print(f"Previous Central State : {current_ver}+{current_build}")
+        print(f"Reserved Version       : {version_full}")
         print(f"Release Tag            : {release_tag}")
-        print(f"Release Title          : {release_title}")
         print(f"Target APK Asset       : {apk_asset_name}")
-        print(f"Metadata Asset         : {metadata_asset_name}")
-        print(f"Source Repository      : {repository}")
-        print(f"Target Package ID      : {package_name}")
-        print(f"Flutter / Java         : Flutter {flutter_version} ({flutter_channel}) / Java {java_version}")
+        print(f"Status                 : reserved (persisted to central state)")
+
+    return reservation
+
+
+def cmd_finalize_release(args: argparse.Namespace) -> None:
+    """
+    Finalize a successfully published release in central state:
+    - Mark reservation status = 'published'
+    - Update channel release record (channels.production / channels.development)
+    - Ensure newer reservations are never rolled back
+    """
+    state_path = Path(args.state_file).resolve()
+    data = load_state(state_path)
+
+    app_id = args.app.strip().lower()
+    if app_id not in data["apps"]:
+        raise KeyError(f"App '{args.app}' not found in state file: {state_path}")
+
+    app_config = data["apps"][app_id]
+    build_number = int(args.build_number)
+    run_id = str(args.run_id or "")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # Find the corresponding reservation
+    matched_reservation = None
+    for res in app_config.get("reservations", []):
+        if res.get("build_number") == build_number and (not run_id or res.get("run_id") == run_id):
+            matched_reservation = res
+            break
+
+    if not matched_reservation:
+        # Fallback to active_reservation if matching
+        active = app_config.get("active_reservation")
+        if active and active.get("build_number") == build_number:
+            matched_reservation = active
+
+    if matched_reservation:
+        matched_reservation["status"] = "published"
+        matched_reservation["updated_at"] = now_iso
+        if args.commit_sha:
+            matched_reservation["commit_sha"] = args.commit_sha
+        channel = matched_reservation["channel"]
+        version_name = matched_reservation["version_name"]
+        release_tag = matched_reservation["release_tag"]
+        apk_asset_name = matched_reservation["apk_asset_name"]
+    else:
+        # If reservation not found in history, infer channel and values from arguments
+        print(f"Warning: Reservation record for build {build_number} not found in history. Using arguments.")
+        channel = args.channel or ("production" if args.branch == "main" else "development")
+        version_name = args.version_name or app_config.get("current_version_name", "1.0.0")
+        release_tag = f"{app_id}-v{version_name}+{build_number}-{channel}"
+        apk_asset_name = f"{app_id}-v{version_name}+{build_number}-{channel}.apk"
+
+    download_base = f"https://github.com/{CENTRAL_REPO}/releases/download/{release_tag}"
+    apk_download_url = f"{download_base}/{apk_asset_name}"
+    sha256_download_url = f"{download_base}/{apk_asset_name}.sha256"
+
+    # Update channel-specific release record only if this build is newer or equal
+    if "channels" not in app_config:
+        app_config["channels"] = {}
+
+    channel_record = app_config["channels"].get(channel, {})
+    existing_channel_build = int(channel_record.get("build_number") or 0)
+
+    if build_number >= existing_channel_build:
+        app_config["channels"][channel] = {
+            "channel": channel,
+            "version_name": version_name,
+            "build_number": build_number,
+            "release_tag": release_tag,
+            "apk_asset_name": apk_asset_name,
+            "apk_download_url": apk_download_url,
+            "sha256_download_url": sha256_download_url,
+            "commit_sha": args.commit_sha or matched_reservation.get("commit_sha") if matched_reservation else None,
+            "published_at": now_iso,
+            "run_id": run_id,
+        }
+        print(f"Channel '{channel}' updated to {version_name}+{build_number}")
+    else:
+        print(
+            f"Notice: Channel '{channel}' already has newer release (build {existing_channel_build}). "
+            f"Not rolling back channel record for build {build_number}."
+        )
+
+    # Protect current build number from accidental rollback by stale runs
+    app_config["current_build_number"] = max(
+        int(app_config.get("current_build_number", 0)), build_number
+    )
+    app_config["updated_at"] = now_iso
+
+    # Update last_build record
+    app_config["last_build"] = {
+        "channel": channel,
+        "branch": matched_reservation.get("branch") if matched_reservation else args.branch,
+        "commit_sha": args.commit_sha or (matched_reservation.get("commit_sha") if matched_reservation else None),
+        "version_name": version_name,
+        "build_number": build_number,
+        "release_tag": release_tag,
+        "built_at": now_iso,
+        "status": "published",
+    }
+
+    # Clear active_reservation if it matches this build
+    active = app_config.get("active_reservation")
+    if active and isinstance(active, dict) and active.get("build_number") == build_number:
+        app_config["active_reservation"] = None
+
+    save_state(state_path, data)
+
+    print(f"Release successfully finalized for '{app_id}':")
+    print(f"  Channel      : {channel}")
+    print(f"  Version      : {version_name}+{build_number}")
+    print(f"  Release Tag  : {release_tag}")
+    print(f"  Status       : published")
+
+
+def cmd_record_failure(args: argparse.Namespace) -> None:
+    """
+    Record build or publishing failure in central state.
+    CRITICAL: Never decrements or releases the reserved build number.
+    """
+    state_path = Path(args.state_file).resolve()
+    data = load_state(state_path)
+
+    app_id = args.app.strip().lower()
+    if app_id not in data["apps"]:
+        print(f"App '{args.app}' not in state, skipping failure record.")
+        return
+
+    app_config = data["apps"][app_id]
+    build_number = int(args.build_number)
+    run_id = str(args.run_id or "")
+    reason = args.reason or "failed"
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # Find matching reservation and mark status
+    for res in app_config.get("reservations", []):
+        if res.get("build_number") == build_number and (not run_id or res.get("run_id") == run_id):
+            res["status"] = reason
+            res["updated_at"] = now_iso
+            if args.commit_sha:
+                res["commit_sha"] = args.commit_sha
+            print(f"Reservation {res['reservation_id']} marked as '{reason}'.")
+            break
+
+    # If active reservation matches, mark or clear it
+    active = app_config.get("active_reservation")
+    if active and isinstance(active, dict) and active.get("build_number") == build_number:
+        app_config["active_reservation"]["status"] = reason
+        app_config["active_reservation"]["updated_at"] = now_iso
+
+    app_config["updated_at"] = now_iso
+    save_state(state_path, data)
+
+    print(f"Failure recorded for {app_id} build {build_number} (status={reason}). Build number preserved as consumed.")
 
 
 def cmd_apply_to_source(args: argparse.Namespace) -> None:
@@ -316,79 +549,6 @@ def cmd_generate_metadata(args: argparse.Namespace) -> None:
     print(f"  Download URL : {apk_download_url}")
 
 
-def cmd_record_success(args: argparse.Namespace) -> None:
-    """Record successful release in the central version state file with channel tracking."""
-    state_path = Path(args.state_file).resolve()
-    data = load_state(state_path)
-
-    app_id = args.app.strip().lower()
-    if app_id not in data["apps"]:
-        raise KeyError(f"App '{args.app}' not found in state file: {state_path}")
-
-    app_config = data["apps"][app_id]
-    current_build = int(app_config.get("current_build_number", 0))
-    new_build = int(args.build_number)
-
-    if new_build <= current_build:
-        raise ValueError(
-            f"Cannot update state: New build number ({new_build}) must be strictly greater than "
-            f"current build number ({current_build}). Monotonic build numbers required."
-        )
-
-    parse_semver(args.version_name)
-
-    channel, is_prerelease = resolve_channel(args.branch)
-    now_iso = datetime.now(timezone.utc).isoformat()
-
-    download_base = f"https://github.com/{CENTRAL_REPO}/releases/download/{args.release_tag}"
-    apk_download_url = f"{download_base}/{args.apk_asset_name}"
-    sha256_download_url = f"{download_base}/{args.apk_asset_name}.sha256"
-
-    # 1. Update overall central version and build number
-    app_config["current_version_name"] = args.version_name
-    app_config["current_build_number"] = new_build
-    app_config["updated_at"] = now_iso
-
-    # 2. Update channel-specific record
-    if "channels" not in app_config:
-        app_config["channels"] = {}
-
-    app_config["channels"][channel] = {
-        "channel": channel,
-        "version_name": args.version_name,
-        "build_number": new_build,
-        "release_tag": args.release_tag,
-        "apk_asset_name": args.apk_asset_name,
-        "apk_download_url": apk_download_url,
-        "sha256_download_url": sha256_download_url,
-        "commit_sha": args.commit_sha,
-        "published_at": now_iso,
-    }
-
-    # 3. Update last_build metadata
-    app_config["last_build"] = {
-        "channel": channel,
-        "branch": args.branch,
-        "commit_sha": args.commit_sha,
-        "version_name": args.version_name,
-        "build_number": new_build,
-        "release_tag": args.release_tag,
-        "built_at": now_iso,
-    }
-
-    save_state(state_path, data)
-
-    print(f"Central state successfully updated for '{app_id}':")
-    print(f"  Channel      : {channel}")
-    print(f"  Version Name : {args.version_name}")
-    print(f"  Build Number : {new_build}")
-    print(f"  Branch       : {args.branch}")
-    print(f"  Commit SHA   : {args.commit_sha}")
-    print(f"  Release Tag  : {args.release_tag}")
-    print(f"  Download URL : {apk_download_url}")
-    print(f"  Timestamp    : {now_iso}")
-
-
 def cmd_validate_state(args: argparse.Namespace) -> None:
     """Validate format and consistency of the state file."""
     state_path = Path(args.state_file).resolve()
@@ -424,17 +584,44 @@ def cmd_validate_state(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Centralized Release & Channel Manager")
+    parser = argparse.ArgumentParser(description="Centralized Build Reservation & Channel Manager")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # Subcommand: calculate
-    calc_parser = subparsers.add_parser("calculate", help="Calculate next version and channel")
-    calc_parser.add_argument("--app", required=True, help="App identifier (e.g. onewallet)")
-    calc_parser.add_argument("--branch", required=True, help="Branch ('development' or 'main')")
-    calc_parser.add_argument(
+    # Subcommand: reserve
+    res_parser = subparsers.add_parser("reserve", help="Reserve and persist next build number")
+    res_parser.add_argument("--app", required=True, help="App identifier (e.g. onewallet)")
+    res_parser.add_argument("--branch", required=True, help="Branch ('development' or 'main')")
+    res_parser.add_argument("--run-id", default=None, help="GitHub Actions run ID")
+    res_parser.add_argument("--run-attempt", default=1, type=int, help="Run attempt number")
+    res_parser.add_argument("--commit-sha", default=None, help="Source commit SHA if known")
+    res_parser.add_argument(
         "--state-file", default="version-state.json", help="Path to version-state.json"
     )
-    calc_parser.add_argument("--json", action="store_true", help="Output JSON result")
+    res_parser.add_argument("--json", action="store_true", help="Output JSON result")
+
+    # Subcommand: finalize-release
+    fin_parser = subparsers.add_parser("finalize-release", help="Finalize successful release")
+    fin_parser.add_argument("--app", required=True, help="App identifier")
+    fin_parser.add_argument("--build-number", required=True, type=int, help="Build number published")
+    fin_parser.add_argument("--version-name", default=None, help="Version name published")
+    fin_parser.add_argument("--branch", default="development", help="Source branch")
+    fin_parser.add_argument("--channel", default=None, help="Channel (production/development)")
+    fin_parser.add_argument("--commit-sha", default=None, help="Source commit SHA")
+    fin_parser.add_argument("--run-id", default=None, help="GitHub Actions run ID")
+    fin_parser.add_argument(
+        "--state-file", default="version-state.json", help="Path to version-state.json"
+    )
+
+    # Subcommand: record-failure
+    fail_parser = subparsers.add_parser("record-failure", help="Record build/publish failure")
+    fail_parser.add_argument("--app", required=True, help="App identifier")
+    fail_parser.add_argument("--build-number", required=True, type=int, help="Build number that failed")
+    fail_parser.add_argument("--run-id", default=None, help="GitHub Actions run ID")
+    fail_parser.add_argument("--reason", default="failed", help="Failure reason (failed/cancelled)")
+    fail_parser.add_argument("--commit-sha", default=None, help="Source commit SHA")
+    fail_parser.add_argument(
+        "--state-file", default="version-state.json", help="Path to version-state.json"
+    )
 
     # Subcommand: apply-to-source
     apply_parser = subparsers.add_parser(
@@ -461,21 +648,6 @@ def main() -> None:
     meta_parser.add_argument("--apk-path", required=True, help="Path to signed APK")
     meta_parser.add_argument("--output-file", required=True, help="Path to write metadata JSON")
 
-    # Subcommand: record-success
-    rec_parser = subparsers.add_parser(
-        "record-success", help="Record successful build into central version-state.json"
-    )
-    rec_parser.add_argument("--app", required=True, help="App identifier (e.g. onewallet)")
-    rec_parser.add_argument("--version-name", required=True, help="New version name")
-    rec_parser.add_argument("--build-number", required=True, type=int, help="New build number")
-    rec_parser.add_argument("--branch", required=True, help="Source branch used")
-    rec_parser.add_argument("--commit-sha", required=True, help="Source commit SHA")
-    rec_parser.add_argument("--release-tag", required=True, help="Release tag published")
-    rec_parser.add_argument("--apk-asset-name", required=True, help="APK asset name")
-    rec_parser.add_argument(
-        "--state-file", default="version-state.json", help="Path to version-state.json"
-    )
-
     # Subcommand: validate-state
     val_parser = subparsers.add_parser("validate-state", help="Validate version-state.json syntax")
     val_parser.add_argument(
@@ -484,14 +656,16 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.command == "calculate":
-        cmd_calculate(args)
+    if args.command == "reserve":
+        cmd_reserve(args)
+    elif args.command == "finalize-release":
+        cmd_finalize_release(args)
+    elif args.command == "record-failure":
+        cmd_record_failure(args)
     elif args.command == "apply-to-source":
         cmd_apply_to_source(args)
     elif args.command == "generate-metadata":
         cmd_generate_metadata(args)
-    elif args.command == "record-success":
-        cmd_record_success(args)
     elif args.command == "validate-state":
         cmd_validate_state(args)
     else:

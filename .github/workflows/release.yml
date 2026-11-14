@@ -22,43 +22,51 @@ on:
 permissions:
   contents: write
 
-concurrency:
-  group: release-${{ inputs.app || 'onewallet' }}
-  cancel-in-progress: false
-
 jobs:
-  build-and-release:
-    name: Build & Release APK (${{ inputs.app }} / ${{ inputs.branch }})
+  # ---------------------------------------------------------------------------------
+  # JOB 1: Reserve Build Number & Version (Globally Serialized Central State Lock)
+  # ---------------------------------------------------------------------------------
+  reserve-version:
+    name: Reserve Build Number (${{ inputs.app }} / ${{ inputs.branch }})
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 10
+    concurrency:
+      group: central-version-state-lock
+      cancel-in-progress: false
+    outputs:
+      APP_ID: ${{ steps.reserve.outputs.APP_ID }}
+      APP_NAME: ${{ steps.reserve.outputs.APP_NAME }}
+      REPOSITORY: ${{ steps.reserve.outputs.REPOSITORY }}
+      PACKAGE_NAME: ${{ steps.reserve.outputs.PACKAGE_NAME }}
+      VERSION_NAME: ${{ steps.reserve.outputs.VERSION_NAME }}
+      BUILD_NUMBER: ${{ steps.reserve.outputs.BUILD_NUMBER }}
+      VERSION_CODE: ${{ steps.reserve.outputs.VERSION_CODE }}
+      VERSION_FULL: ${{ steps.reserve.outputs.VERSION_FULL }}
+      CHANNEL: ${{ steps.reserve.outputs.CHANNEL }}
+      IS_PRERELEASE: ${{ steps.reserve.outputs.IS_PRERELEASE }}
+      RELEASE_TAG: ${{ steps.reserve.outputs.RELEASE_TAG }}
+      RELEASE_TITLE: ${{ steps.reserve.outputs.RELEASE_TITLE }}
+      APK_ASSET_NAME: ${{ steps.reserve.outputs.APK_ASSET_NAME }}
+      METADATA_ASSET_NAME: ${{ steps.reserve.outputs.METADATA_ASSET_NAME }}
+      RESERVATION_ID: ${{ steps.reserve.outputs.RESERVATION_ID }}
+      FLUTTER_VERSION: ${{ steps.reserve.outputs.FLUTTER_VERSION }}
+      FLUTTER_CHANNEL: ${{ steps.reserve.outputs.FLUTTER_CHANNEL }}
+      JAVA_VERSION: ${{ steps.reserve.outputs.JAVA_VERSION }}
+      SOURCE_BRANCH: ${{ steps.reserve.outputs.SOURCE_BRANCH }}
 
     steps:
-      # 1. Checkout central release repository (to read state, scripts, and commit updated state)
       - name: Checkout central release repository
         uses: actions/checkout@v4
         with:
-          path: central-repo
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # 2. Setup Python environment for version calculation script
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # 3. Calculate next version, channel, and export variables
-      - name: Calculate version from central state
-        id: version
-        working-directory: central-repo
-        run: |
-          python scripts/manage_version.py calculate \
-            --app "${{ inputs.app }}" \
-            --branch "${{ inputs.branch }}" \
-            --state-file "version-state.json"
-
-      # 4. Verify required GitHub Secrets are configured
-      - name: Verify required secrets
+      - name: Verify required secrets before reservation
         shell: bash
         env:
           SOURCE_REPO_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
@@ -74,26 +82,97 @@ jobs:
           [[ -z "$ANDROID_KEY_PASSWORD" ]] && missing+=("ANDROID_KEY_PASSWORD")
 
           if [ ${#missing[@]} -ne 0 ]; then
-            echo "::error::The following required GitHub Secrets are missing in app-release repository:"
+            echo "::error::Required secrets missing in app-release. Failing before reserving build number:"
             for sec in "${missing[@]}"; do
               echo "  - $sec"
             done
-            echo "Please configure them under: Repository Settings -> Secrets and variables -> Actions."
             exit 1
           fi
-          echo "All required secrets are present."
+          echo "All required secrets verified."
 
-      # 5. Fetch selected branch from the private source application repository
+      - name: Atomically reserve and persist build number
+        id: reserve
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          MAX_ATTEMPTS=5
+          for attempt in $(seq 1 $MAX_ATTEMPTS); do
+            echo "Attempt $attempt of $MAX_ATTEMPTS to reserve and push version state..."
+            git fetch origin main
+            git checkout main
+            git reset --hard origin/main
+
+            # Run reservation script which updates version-state.json and exports outputs
+            python scripts/manage_version.py reserve \
+              --app "${{ inputs.app }}" \
+              --branch "${{ inputs.branch }}" \
+              --run-id "${{ github.run_id }}" \
+              --run-attempt "${{ github.run_attempt }}" \
+              --state-file "version-state.json"
+
+            git add version-state.json
+
+            if git diff --staged --quiet; then
+              echo "Reservation already recorded for this run_id."
+              break
+            fi
+
+            git commit -m "chore(version): reserve ${{ inputs.app }} build [skip ci]"
+
+            if git push origin main; then
+              echo "Reservation successfully committed and pushed to origin main."
+              break
+            fi
+
+            if [ "$attempt" -eq "$MAX_ATTEMPTS" ]; then
+              echo "::error::Failed to push version reservation after $MAX_ATTEMPTS attempts."
+              exit 1
+            fi
+
+            JITTER=$(( (RANDOM % 3) + 2 ))
+            echo "Push conflict, retrying reservation in $JITTER seconds..."
+            sleep $JITTER
+          done
+
+  # ---------------------------------------------------------------------------------
+  # JOB 2: Build APK & Publish Release (App-Specific Concurrency)
+  # ---------------------------------------------------------------------------------
+  build-and-release:
+    name: Build & Publish APK (${{ inputs.app }} / ${{ inputs.branch }})
+    needs: reserve-version
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency:
+      group: build-${{ inputs.app }}
+      cancel-in-progress: false
+    outputs:
+      COMMIT_SHA: ${{ steps.source_meta.outputs.COMMIT_SHA }}
+
+    steps:
+      - name: Checkout central release repository (tools & scripts)
+        uses: actions/checkout@v4
+        with:
+          path: central-repo
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       - name: Checkout source application repository
         uses: actions/checkout@v4
         with:
-          repository: ${{ steps.version.outputs.REPOSITORY }}
-          ref: ${{ inputs.branch }}
+          repository: ${{ needs.reserve-version.outputs.REPOSITORY }}
+          ref: ${{ needs.reserve-version.outputs.SOURCE_BRANCH }}
           token: ${{ secrets.SOURCE_REPO_TOKEN }}
           path: source-repo
           fetch-depth: 1
 
-      # 6. Record source commit SHA and metadata
       - name: Record source commit metadata
         id: source_meta
         working-directory: source-repo
@@ -105,36 +184,32 @@ jobs:
           echo "COMMIT_SHA=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
           echo "SHORT_SHA=$SHORT_SHA" >> "$GITHUB_OUTPUT"
           echo "BUILD_TIMESTAMP=$BUILD_TIME" >> "$GITHUB_OUTPUT"
-          echo "Source Repository : ${{ steps.version.outputs.REPOSITORY }}"
-          echo "Selected Branch   : ${{ inputs.branch }}"
-          echo "Release Channel   : ${{ steps.version.outputs.CHANNEL }}"
+          echo "Source Repository : ${{ needs.reserve-version.outputs.REPOSITORY }}"
+          echo "Selected Branch   : ${{ needs.reserve-version.outputs.SOURCE_BRANCH }}"
+          echo "Release Channel   : ${{ needs.reserve-version.outputs.CHANNEL }}"
           echo "Source Commit SHA : $COMMIT_SHA"
           echo "Build Timestamp   : $BUILD_TIME"
 
-      # 7. Apply calculated version to fetched Flutter pubspec.yaml (runner memory only, never committed to source)
-      - name: Apply version to source pubspec.yaml
+      - name: Apply reserved version to source pubspec.yaml (runner memory only)
         run: |
           python central-repo/scripts/manage_version.py apply-to-source \
             --source-dir source-repo \
-            --version-name "${{ steps.version.outputs.VERSION_NAME }}" \
-            --build-number "${{ steps.version.outputs.BUILD_NUMBER }}"
+            --version-name "${{ needs.reserve-version.outputs.VERSION_NAME }}" \
+            --build-number "${{ needs.reserve-version.outputs.BUILD_NUMBER }}"
 
-      # 8. Setup Java environment
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: ${{ steps.version.outputs.JAVA_VERSION }}
+          java-version: ${{ needs.reserve-version.outputs.JAVA_VERSION }}
 
-      # 9. Setup Flutter environment
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: ${{ steps.version.outputs.FLUTTER_VERSION }}
-          channel: ${{ steps.version.outputs.FLUTTER_CHANNEL }}
+          flutter-version: ${{ needs.reserve-version.outputs.FLUTTER_VERSION }}
+          channel: ${{ needs.reserve-version.outputs.FLUTTER_CHANNEL }}
           cache: true
 
-      # 10. Configure local.properties with Flutter SDK path
       - name: Configure Android local.properties
         working-directory: source-repo
         shell: bash
@@ -144,7 +219,6 @@ jobs:
           echo "flutter.sdk=$FLUTTER_ROOT" > android/local.properties
           echo "Configured android/local.properties with flutter.sdk=$FLUTTER_ROOT"
 
-      # 11. Restore Android signing keystore and key.properties
       - name: Setup Android release signing
         working-directory: source-repo
         shell: bash
@@ -155,13 +229,8 @@ jobs:
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
         run: |
           set -euo pipefail
-
           mkdir -p android/app
-
-          # Decode keystore file into standard android/app location
           printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/app/upload-keystore.jks
-
-          # Also copy to android/upload-keystore.jks for rootProject compatibility
           cp android/app/upload-keystore.jks android/upload-keystore.jks
 
           KEY_ALIAS="${ANDROID_KEY_ALIAS:-upload}"
@@ -175,12 +244,10 @@ jobs:
 
           echo "Android release signing configured with key alias: $KEY_ALIAS"
 
-      # 12. Resolve Flutter dependencies
       - name: Install Flutter dependencies
         working-directory: source-repo
         run: flutter pub get
 
-      # 13. Generate app launcher icons if configured in project
       - name: Generate app icons (if configured)
         working-directory: source-repo
         shell: bash
@@ -192,16 +259,14 @@ jobs:
             echo "flutter_launcher_icons not found in pubspec.yaml, skipping."
           fi
 
-      # 14. Build signed Android release APK with retry
       - name: Build signed release APK
         working-directory: source-repo
         shell: bash
         env:
-          VERSION_NAME: ${{ steps.version.outputs.VERSION_NAME }}
-          BUILD_NUMBER: ${{ steps.version.outputs.BUILD_NUMBER }}
+          VERSION_NAME: ${{ needs.reserve-version.outputs.VERSION_NAME }}
+          BUILD_NUMBER: ${{ needs.reserve-version.outputs.BUILD_NUMBER }}
         run: |
           set -euo pipefail
-
           echo "Building signed release APK..."
           echo "  versionName : $VERSION_NAME"
           echo "  versionCode : $BUILD_NUMBER"
@@ -224,17 +289,15 @@ jobs:
             sleep 20
           done
 
-      # 15. Validate APK existence, signature, package name, and prepare assets
       - name: Validate release APK and prepare assets
         shell: bash
         env:
-          EXPECTED_PACKAGE_NAME: ${{ steps.version.outputs.PACKAGE_NAME }}
+          EXPECTED_PACKAGE_NAME: ${{ needs.reserve-version.outputs.PACKAGE_NAME }}
           APK_PATH: "source-repo/build/app/outputs/flutter-apk/app-release.apk"
-          ASSET_NAME: ${{ steps.version.outputs.APK_ASSET_NAME }}
-          METADATA_NAME: ${{ steps.version.outputs.METADATA_ASSET_NAME }}
+          ASSET_NAME: ${{ needs.reserve-version.outputs.APK_ASSET_NAME }}
+          METADATA_NAME: ${{ needs.reserve-version.outputs.METADATA_ASSET_NAME }}
         run: |
           set -euo pipefail
-
           if [[ ! -f "$APK_PATH" ]]; then
             echo "::error::APK file not found at $APK_PATH"
             exit 1
@@ -279,50 +342,48 @@ jobs:
           cp "$APK_PATH" "release-assets/$ASSET_NAME"
           (cd release-assets && sha256sum "$ASSET_NAME" > "${ASSET_NAME}.sha256")
 
-          # Generate machine-readable release metadata JSON
+          # Generate public release-metadata.json
           python central-repo/scripts/manage_version.py generate-metadata \
-            --app "${{ steps.version.outputs.APP_ID }}" \
-            --app-name "${{ steps.version.outputs.APP_NAME }}" \
-            --package-name "${{ steps.version.outputs.PACKAGE_NAME }}" \
-            --version-name "${{ steps.version.outputs.VERSION_NAME }}" \
-            --build-number "${{ steps.version.outputs.BUILD_NUMBER }}" \
-            --branch "${{ inputs.branch }}" \
+            --app "${{ needs.reserve-version.outputs.APP_ID }}" \
+            --app-name "${{ needs.reserve-version.outputs.APP_NAME }}" \
+            --package-name "${{ needs.reserve-version.outputs.PACKAGE_NAME }}" \
+            --version-name "${{ needs.reserve-version.outputs.VERSION_NAME }}" \
+            --build-number "${{ needs.reserve-version.outputs.BUILD_NUMBER }}" \
+            --branch "${{ needs.reserve-version.outputs.SOURCE_BRANCH }}" \
             --commit-sha "${{ steps.source_meta.outputs.COMMIT_SHA }}" \
-            --release-tag "${{ steps.version.outputs.RELEASE_TAG }}" \
-            --release-title "${{ steps.version.outputs.RELEASE_TITLE }}" \
-            --apk-asset-name "${{ steps.version.outputs.APK_ASSET_NAME }}" \
+            --release-tag "${{ needs.reserve-version.outputs.RELEASE_TAG }}" \
+            --release-title "${{ needs.reserve-version.outputs.RELEASE_TITLE }}" \
+            --apk-asset-name "${{ needs.reserve-version.outputs.APK_ASSET_NAME }}" \
             --apk-path "release-assets/$ASSET_NAME" \
             --output-file "release-assets/$METADATA_NAME"
 
           echo "Prepared release assets in release-assets/:"
           ls -lh release-assets/
 
-      # 16. Upload APK as workflow run artifact (14-day retention)
       - name: Upload APK workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.version.outputs.APK_ASSET_NAME }}
+          name: ${{ needs.reserve-version.outputs.APK_ASSET_NAME }}
           path: release-assets/
           retention-days: 14
           if-no-files-found: error
 
-      # 17. Generate release notes
       - name: Generate release notes
         shell: bash
         env:
-          APP_ID: ${{ steps.version.outputs.APP_ID }}
-          APP_NAME: ${{ steps.version.outputs.APP_NAME }}
-          VERSION_NAME: ${{ steps.version.outputs.VERSION_NAME }}
-          BUILD_NUMBER: ${{ steps.version.outputs.BUILD_NUMBER }}
-          CHANNEL: ${{ steps.version.outputs.CHANNEL }}
-          SOURCE_BRANCH: ${{ inputs.branch }}
+          APP_ID: ${{ needs.reserve-version.outputs.APP_ID }}
+          APP_NAME: ${{ needs.reserve-version.outputs.APP_NAME }}
+          VERSION_NAME: ${{ needs.reserve-version.outputs.VERSION_NAME }}
+          BUILD_NUMBER: ${{ needs.reserve-version.outputs.BUILD_NUMBER }}
+          CHANNEL: ${{ needs.reserve-version.outputs.CHANNEL }}
+          SOURCE_BRANCH: ${{ needs.reserve-version.outputs.SOURCE_BRANCH }}
           SOURCE_COMMIT: ${{ steps.source_meta.outputs.COMMIT_SHA }}
           BUILD_TIMESTAMP: ${{ steps.source_meta.outputs.BUILD_TIMESTAMP }}
-          ASSET_NAME: ${{ steps.version.outputs.APK_ASSET_NAME }}
-          METADATA_NAME: ${{ steps.version.outputs.METADATA_ASSET_NAME }}
-          PACKAGE_NAME: ${{ steps.version.outputs.PACKAGE_NAME }}
-          REPOSITORY: ${{ steps.version.outputs.REPOSITORY }}
-          RELEASE_TAG: ${{ steps.version.outputs.RELEASE_TAG }}
+          ASSET_NAME: ${{ needs.reserve-version.outputs.APK_ASSET_NAME }}
+          METADATA_NAME: ${{ needs.reserve-version.outputs.METADATA_ASSET_NAME }}
+          PACKAGE_NAME: ${{ needs.reserve-version.outputs.PACKAGE_NAME }}
+          REPOSITORY: ${{ needs.reserve-version.outputs.REPOSITORY }}
+          RELEASE_TAG: ${{ needs.reserve-version.outputs.RELEASE_TAG }}
         run: |
           cat > release-notes.md <<EOF
           # $APP_NAME Release v${VERSION_NAME}+${BUILD_NUMBER} (${CHANNEL^} Channel)
@@ -348,20 +409,17 @@ jobs:
 
           *Note: This repository is public. All release assets and metadata can be downloaded directly without authentication.*
           EOF
-
           cat release-notes.md
 
-      # 18. Publish release to public app-release repository
       - name: Publish GitHub Release
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.version.outputs.RELEASE_TAG }}
-          TITLE: ${{ steps.version.outputs.RELEASE_TITLE }}
-          IS_PRERELEASE: ${{ steps.version.outputs.IS_PRERELEASE }}
+          TAG: ${{ needs.reserve-version.outputs.RELEASE_TAG }}
+          TITLE: ${{ needs.reserve-version.outputs.RELEASE_TITLE }}
+          IS_PRERELEASE: ${{ needs.reserve-version.outputs.IS_PRERELEASE }}
         run: |
           set -euo pipefail
-
           PRERELEASE_FLAG=""
           if [[ "$IS_PRERELEASE" == "true" ]]; then
             PRERELEASE_FLAG="--prerelease"
@@ -379,61 +437,126 @@ jobs:
               --notes-file release-notes.md \
               $PRERELEASE_FLAG
           fi
-
           echo "Release successfully published."
 
-      # 19. Commit updated central version state to app-release repository
-      - name: Commit updated central version state
+  # ---------------------------------------------------------------------------------
+  # JOB 3: Finalize Central Version State (Globally Serialized Central State Lock)
+  # ---------------------------------------------------------------------------------
+  finalize-state:
+    name: Finalize Version State
+    needs: [reserve-version, build-and-release]
+    if: always() && needs.reserve-version.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: central-version-state-lock
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout central release repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Finalize successful release state
+        if: needs.build-and-release.result == 'success'
         shell: bash
-        working-directory: central-repo
-        env:
-          APP_ID: ${{ steps.version.outputs.APP_ID }}
-          APP_NAME: ${{ steps.version.outputs.APP_NAME }}
-          VERSION_NAME: ${{ steps.version.outputs.VERSION_NAME }}
-          BUILD_NUMBER: ${{ steps.version.outputs.BUILD_NUMBER }}
-          SOURCE_BRANCH: ${{ inputs.branch }}
-          SOURCE_COMMIT: ${{ steps.source_meta.outputs.COMMIT_SHA }}
-          RELEASE_TAG: ${{ steps.version.outputs.RELEASE_TAG }}
-          APK_ASSET_NAME: ${{ steps.version.outputs.APK_ASSET_NAME }}
         run: |
           set -euo pipefail
-
-          echo "Recording successful release in central version-state.json..."
-          python scripts/manage_version.py record-success \
-            --app "$APP_ID" \
-            --version-name "$VERSION_NAME" \
-            --build-number "$BUILD_NUMBER" \
-            --branch "$SOURCE_BRANCH" \
-            --commit-sha "$SOURCE_COMMIT" \
-            --release-tag "$RELEASE_TAG" \
-            --apk-asset-name "$APK_ASSET_NAME" \
-            --state-file "version-state.json"
-
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add version-state.json
+          MAX_ATTEMPTS=5
+          for attempt in $(seq 1 $MAX_ATTEMPTS); do
+            echo "Attempt $attempt of $MAX_ATTEMPTS to finalize successful release..."
+            git fetch origin main
+            git checkout main
+            git reset --hard origin/main
 
-          if git diff --cached --quiet; then
-            echo "No version state changes to commit."
-            exit 0
-          fi
+            python scripts/manage_version.py finalize-release \
+              --app "${{ needs.reserve-version.outputs.APP_ID }}" \
+              --build-number "${{ needs.reserve-version.outputs.BUILD_NUMBER }}" \
+              --run-id "${{ github.run_id }}" \
+              --commit-sha "${{ needs.build-and-release.outputs.COMMIT_SHA }}" \
+              --state-file "version-state.json"
 
-          git commit -m "chore(release): bump $APP_NAME to $VERSION_NAME+$BUILD_NUMBER ($SOURCE_BRANCH) [skip ci]"
+            git add version-state.json
 
-          echo "Pushing updated version state to central repository..."
-          for attempt in 1 2 3; do
-            git pull --rebase origin main
-            if git push origin main; then
-              echo "Version state successfully committed and pushed to central repository."
+            if git diff --staged --quiet; then
+              echo "No state changes to commit."
               break
             fi
 
-            if [[ "$attempt" -eq 3 ]]; then
-              echo "::error::Failed to push version state after 3 attempts."
+            git commit -m "chore(release): finalize ${{ needs.reserve-version.outputs.APP_NAME }} v${{ needs.reserve-version.outputs.VERSION_FULL }} [skip ci]"
+
+            if git push origin main; then
+              echo "Release finalized and state successfully pushed."
+              break
+            fi
+
+            if [ "$attempt" -eq "$MAX_ATTEMPTS" ]; then
+              echo "::error::Failed to push release finalization after $MAX_ATTEMPTS attempts."
               exit 1
             fi
 
-            echo "Push conflict or failure, retrying in 5 seconds..."
-            sleep 5
+            JITTER=$(( (RANDOM % 3) + 2 ))
+            echo "Push conflict, retrying finalization in $JITTER seconds..."
+            sleep $JITTER
           done
+
+      - name: Record failure or cancellation in central state
+        if: needs.build-and-release.result != 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          MAX_ATTEMPTS=5
+          for attempt in $(seq 1 $MAX_ATTEMPTS); do
+            echo "Attempt $attempt of $MAX_ATTEMPTS to record failure state..."
+            git fetch origin main
+            git checkout main
+            git reset --hard origin/main
+
+            python scripts/manage_version.py record-failure \
+              --app "${{ needs.reserve-version.outputs.APP_ID }}" \
+              --build-number "${{ needs.reserve-version.outputs.BUILD_NUMBER }}" \
+              --run-id "${{ github.run_id }}" \
+              --reason "${{ needs.build-and-release.result }}" \
+              --commit-sha "${{ needs.build-and-release.outputs.COMMIT_SHA }}" \
+              --state-file "version-state.json"
+
+            git add version-state.json
+
+            if git diff --staged --quiet; then
+              echo "No state changes to commit."
+              break
+            fi
+
+            git commit -m "chore(version): record ${{ needs.reserve-version.outputs.APP_ID }} build ${{ needs.reserve-version.outputs.BUILD_NUMBER }} ${{ needs.build-and-release.result }} [skip ci]"
+
+            if git push origin main; then
+              echo "Failure recorded and state pushed."
+              break
+            fi
+
+            if [ "$attempt" -eq "$MAX_ATTEMPTS" ]; then
+              echo "::warning::Failed to record failure state after $MAX_ATTEMPTS attempts."
+              break
+            fi
+
+            JITTER=$(( (RANDOM % 3) + 2 ))
+            echo "Push conflict, retrying failure record in $JITTER seconds..."
+            sleep $JITTER
+          done
+
+          # Re-fail job so overall workflow displays failure status
+          echo "::error::Build job failed with status: ${{ needs.build-and-release.result }}"
+          exit 1

@@ -9,21 +9,25 @@ This repository was created to completely separate release mechanics from applic
 ## What This Repository Does
 
 * Centrally manages application version names and Android build numbers so versions remain consistent and never conflict.
+* Reliably reserves build numbers before building, guaranteeing that build numbers are never reused or decreased even if builds fail or get cancelled.
+* Protects shared central version state against concurrent workflow runs across multiple applications.
 * Builds signed release APKs on demand for one or more Flutter applications, starting with Onewallet.
 * Supports separate release channels for production and development.
-* Publishes public GitHub Releases with downloadable APKs and integrity checksums that can be accessed without authentication.
+* Publishes public GitHub Releases with downloadable APKs, checksums, and machine-readable metadata that can be accessed without authentication.
 * Keeps the source application repository completely untouched without creating commits or tags inside it.
 
 ## How It Works
 
 * **Manual Trigger:** Builds are never triggered automatically on push. A maintainer manually triggers a build from the Actions tab and selects the app and the source branch.
+* **Pre-Build Number Reservation:** Before starting the Flutter build, the workflow atomically reserves and persists the next build number in the central repository. Once reserved, that build number is permanently consumed. Even if the compile step fails, APK validation fails, release publishing fails, or the workflow is cancelled, that build number will never be reused by any future run.
+* **Monotonic Build Numbers:** Android requires that every new APK has a strictly higher build number (versionCode) than previous installs. If a build fails, its number is skipped and the next run receives the next higher number. Build numbers are never decreased, reset, or recycled.
+* **Shared State Concurrency Protection:** State modifications (reserving build numbers and finalizing releases) are globally serialized using a dedicated concurrency lock across all applications. If multiple builds run, their state updates queue safely and use automated git rebase retries, ensuring that different applications never corrupt or overwrite each other's central state. The long-running APK build steps run concurrently per application.
 * **Release Channels:**
   * Selecting the main branch creates a production release. The version name remains unchanged while the build number increases by one. The release is published as an official release.
   * Selecting the development branch creates a development build. The patch portion of the version name increases by one and the build number increases by one. The release is published as a pre-release.
-* **Monotonic Build Numbers:** Android requires that every new APK has a higher build number (versionCode) than previous installs. The build number increases on every run, whether development or production, and is never reused or decreased.
-* **Build and Signing:** The workflow fetches the chosen branch from the source repository, applies the calculated version only inside the runner workspace, signs the APK using secrets stored in this repository, and verifies the APK signature and package identifier.
+* **Channel and Failure Isolation:** If a build fails, its failure is recorded on that specific reservation, but the channel's last successful release metadata is left untouched. A failed build will never overwrite the latest successful production or development release record.
+* **Build and Signing:** The workflow fetches the chosen branch from the source repository, applies the reserved version only inside the runner workspace, signs the APK using secrets stored in this repository, and verifies the APK signature and package identifier.
 * **Public Releases:** Built APKs are published directly to this repository's Releases page. Because this repository is public, any user or Flutter app can check for updates and download APKs directly without needing GitHub tokens or credentials.
-* **Central State Tracking:** After a successful release, the central state file in this repository is updated with the new version and timestamp so the next build knows where to continue.
 
 ## Steps to Use This Repository
 
