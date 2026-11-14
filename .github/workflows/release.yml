@@ -1,0 +1,411 @@
+name: Centralized APK Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Source branch to build'
+        required: true
+        default: 'development'
+        type: choice
+        options:
+          - development
+          - main
+      app:
+        description: 'Application identifier'
+        required: true
+        default: 'onewallet'
+        type: choice
+        options:
+          - onewallet
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.app || 'onewallet' }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    name: Build & Release APK (${{ inputs.app }} / ${{ inputs.branch }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # 1. Checkout central release repository (to read state, scripts, and commit updated state)
+      - name: Checkout central release repository
+        uses: actions/checkout@v4
+        with:
+          path: central-repo
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # 2. Setup Python environment for version calculation script
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 3. Calculate next version and export variables
+      - name: Calculate version from central state
+        id: version
+        working-directory: central-repo
+        run: |
+          python scripts/manage_version.py calculate \
+            --app "${{ inputs.app }}" \
+            --branch "${{ inputs.branch }}" \
+            --state-file "version-state.json"
+
+      # 4. Verify required GitHub Secrets are configured
+      - name: Verify required secrets
+        shell: bash
+        env:
+          SOURCE_REPO_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [[ -z "$SOURCE_REPO_TOKEN" ]] && missing+=("SOURCE_REPO_TOKEN")
+          [[ -z "$ANDROID_KEYSTORE_BASE64" ]] && missing+=("ANDROID_KEYSTORE_BASE64")
+          [[ -z "$ANDROID_KEYSTORE_PASSWORD" ]] && missing+=("ANDROID_KEYSTORE_PASSWORD")
+          [[ -z "$ANDROID_KEY_PASSWORD" ]] && missing+=("ANDROID_KEY_PASSWORD")
+
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "::error::The following required GitHub Secrets are missing in app-release repository:"
+            for sec in "${missing[@]}"; do
+              echo "  - $sec"
+            done
+            echo "Please configure them under: Repository Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          echo "All required secrets are present."
+
+      # 5. Fetch selected branch from the private source application repository
+      - name: Checkout source application repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.version.outputs.REPOSITORY }}
+          ref: ${{ inputs.branch }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          path: source-repo
+          fetch-depth: 1
+
+      # 6. Record source commit SHA and metadata
+      - name: Record source commit metadata
+        id: source_meta
+        working-directory: source-repo
+        shell: bash
+        run: |
+          COMMIT_SHA="$(git rev-parse HEAD)"
+          SHORT_SHA="$(git rev-parse --short HEAD)"
+          BUILD_TIME="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          echo "COMMIT_SHA=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+          echo "SHORT_SHA=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "BUILD_TIMESTAMP=$BUILD_TIME" >> "$GITHUB_OUTPUT"
+          echo "Source Repository : ${{ steps.version.outputs.REPOSITORY }}"
+          echo "Selected Branch   : ${{ inputs.branch }}"
+          echo "Source Commit SHA : $COMMIT_SHA"
+          echo "Build Timestamp   : $BUILD_TIME"
+
+      # 7. Apply calculated version to fetched Flutter pubspec.yaml
+      - name: Apply version to source pubspec.yaml
+        run: |
+          python central-repo/scripts/manage_version.py apply-to-source \
+            --source-dir source-repo \
+            --version-name "${{ steps.version.outputs.VERSION_NAME }}" \
+            --build-number "${{ steps.version.outputs.BUILD_NUMBER }}"
+
+      # 8. Setup Java environment
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ steps.version.outputs.JAVA_VERSION }}
+
+      # 9. Setup Flutter environment
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ steps.version.outputs.FLUTTER_VERSION }}
+          channel: ${{ steps.version.outputs.FLUTTER_CHANNEL }}
+          cache: true
+
+      # 10. Configure local.properties with Flutter SDK path
+      - name: Configure Android local.properties
+        working-directory: source-repo
+        shell: bash
+        run: |
+          FLUTTER_BIN="$(command -v flutter)"
+          FLUTTER_ROOT="$(dirname "$(dirname "$FLUTTER_BIN")")"
+          echo "flutter.sdk=$FLUTTER_ROOT" > android/local.properties
+          echo "Configured android/local.properties with flutter.sdk=$FLUTTER_ROOT"
+
+      # 11. Restore Android signing keystore and key.properties
+      - name: Setup Android release signing
+        working-directory: source-repo
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p android/app
+
+          # Decode keystore file into standard android/app location
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/app/upload-keystore.jks
+
+          # Also copy to android/upload-keystore.jks for rootProject compatibility
+          cp android/app/upload-keystore.jks android/upload-keystore.jks
+
+          KEY_ALIAS="${ANDROID_KEY_ALIAS:-upload}"
+
+          cat > android/key.properties <<EOF
+          storePassword=$ANDROID_KEYSTORE_PASSWORD
+          keyPassword=$ANDROID_KEY_PASSWORD
+          keyAlias=$KEY_ALIAS
+          storeFile=upload-keystore.jks
+          EOF
+
+          echo "Android release signing configured with key alias: $KEY_ALIAS"
+
+      # 12. Resolve Flutter dependencies
+      - name: Install Flutter dependencies
+        working-directory: source-repo
+        run: flutter pub get
+
+      # 13. Generate app launcher icons if configured in project
+      - name: Generate app icons (if configured)
+        working-directory: source-repo
+        shell: bash
+        run: |
+          if grep -q "flutter_launcher_icons:" pubspec.yaml; then
+            echo "Running flutter_launcher_icons..."
+            dart run flutter_launcher_icons || echo "Warning: Icon generation exited with non-zero, continuing."
+          else
+            echo "flutter_launcher_icons not found in pubspec.yaml, skipping."
+          fi
+
+      # 14. Build signed Android release APK with retry
+      - name: Build signed release APK
+        working-directory: source-repo
+        shell: bash
+        env:
+          VERSION_NAME: ${{ steps.version.outputs.VERSION_NAME }}
+          BUILD_NUMBER: ${{ steps.version.outputs.BUILD_NUMBER }}
+        run: |
+          set -euo pipefail
+
+          echo "Building signed release APK..."
+          echo "  versionName : $VERSION_NAME"
+          echo "  versionCode : $BUILD_NUMBER"
+
+          for attempt in 1 2 3; do
+            echo "Build attempt $attempt of 3..."
+            if flutter build apk --release \
+                --build-name="$VERSION_NAME" \
+                --build-number="$BUILD_NUMBER"; then
+              echo "APK build successful on attempt $attempt."
+              break
+            fi
+
+            if [[ "$attempt" -eq 3 ]]; then
+              echo "::error::Flutter APK build failed after 3 attempts."
+              exit 1
+            fi
+
+            echo "Build failed. Retrying in 20 seconds..."
+            sleep 20
+          done
+
+      # 15. Validate APK existence, signature, and package name
+      - name: Validate release APK and signature
+        shell: bash
+        env:
+          EXPECTED_PACKAGE_NAME: ${{ steps.version.outputs.PACKAGE_NAME }}
+          APK_PATH: "source-repo/build/app/outputs/flutter-apk/app-release.apk"
+          ASSET_NAME: ${{ steps.version.outputs.APK_ASSET_NAME }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! -f "$APK_PATH" ]]; then
+            echo "::error::APK file not found at $APK_PATH"
+            exit 1
+          fi
+
+          echo "APK file confirmed: $(ls -lh "$APK_PATH" | awk '{print $5}')"
+
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [[ -z "$SDK_ROOT" ]]; then
+            echo "::error::Android SDK path not found in environment."
+            exit 1
+          fi
+
+          APKSIGNER="$(find "$SDK_ROOT/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
+          AAPT="$(find "$SDK_ROOT/build-tools" -type f -name aapt | sort -V | tail -n 1)"
+
+          if [[ -z "$APKSIGNER" || -z "$AAPT" ]]; then
+            echo "::error::apksigner or aapt tools not found in Android SDK ($SDK_ROOT/build-tools)"
+            exit 1
+          fi
+
+          echo "Using apksigner : $APKSIGNER"
+          echo "Using aapt      : $AAPT"
+
+          echo "--- 1. Verifying APK Signature ---"
+          "$APKSIGNER" verify --verbose "$APK_PATH"
+
+          echo "--- 2. Inspecting APK Badging & Package Name ---"
+          BADGING="$("$AAPT" dump badging "$APK_PATH")"
+
+          if [[ -n "$EXPECTED_PACKAGE_NAME" ]]; then
+            if ! grep -Fq "package: name='$EXPECTED_PACKAGE_NAME'" <<< "$BADGING"; then
+              echo "::error::APK package identifier does not match expected '$EXPECTED_PACKAGE_NAME'"
+              exit 1
+            fi
+            echo "APK package identifier successfully verified: $EXPECTED_PACKAGE_NAME"
+          fi
+
+          echo "$BADGING" | grep "package: name="
+
+          mkdir -p release-assets
+          cp "$APK_PATH" "release-assets/$ASSET_NAME"
+          (cd release-assets && sha256sum "$ASSET_NAME" > "${ASSET_NAME}.sha256")
+
+          echo "Prepared release assets in release-assets/:"
+          ls -lh release-assets/
+
+      # 16. Upload APK as workflow run artifact (14-day retention)
+      - name: Upload APK workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.version.outputs.APK_ASSET_NAME }}
+          path: release-assets/
+          retention-days: 14
+          if-no-files-found: error
+
+      # 17. Generate release notes
+      - name: Generate release notes
+        shell: bash
+        env:
+          APP_NAME: ${{ steps.version.outputs.APP_NAME }}
+          VERSION_NAME: ${{ steps.version.outputs.VERSION_NAME }}
+          BUILD_NUMBER: ${{ steps.version.outputs.BUILD_NUMBER }}
+          SOURCE_BRANCH: ${{ inputs.branch }}
+          SOURCE_COMMIT: ${{ steps.source_meta.outputs.COMMIT_SHA }}
+          BUILD_TIMESTAMP: ${{ steps.source_meta.outputs.BUILD_TIMESTAMP }}
+          ASSET_NAME: ${{ steps.version.outputs.APK_ASSET_NAME }}
+          PACKAGE_NAME: ${{ steps.version.outputs.PACKAGE_NAME }}
+          REPOSITORY: ${{ steps.version.outputs.REPOSITORY }}
+        run: |
+          cat > release-notes.md <<EOF
+          # $APP_NAME Release v${VERSION_NAME}+${BUILD_NUMBER} (${SOURCE_BRANCH})
+
+          Automated release built centrally by [app-release](https://github.com/${{ github.repository }}).
+
+          ## Release Metadata
+          - **Application:** $APP_NAME
+          - **Package ID:** \`$PACKAGE_NAME\`
+          - **Version Name:** \`$VERSION_NAME\`
+          - **Build Number (versionCode):** \`$BUILD_NUMBER\`
+          - **Source Repository:** [\`$REPOSITORY\`](https://github.com/$REPOSITORY)
+          - **Source Branch:** \`$SOURCE_BRANCH\`
+          - **Source Commit SHA:** [\`${SOURCE_COMMIT:0:7}\`](https://github.com/$REPOSITORY/commit/$SOURCE_COMMIT)
+          - **Commit Details:** \`$SOURCE_COMMIT\`
+          - **Build Timestamp:** \`$BUILD_TIMESTAMP\`
+
+          ## Release Assets
+          - \`$ASSET_NAME\` (Signed release APK)
+          - \`${ASSET_NAME}.sha256\` (SHA-256 Checksum)
+          EOF
+
+          cat release-notes.md
+
+      # 18. Publish release to central app-release repository
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.RELEASE_TAG }}
+          TITLE: ${{ steps.version.outputs.RELEASE_TITLE }}
+          ASSET_NAME: ${{ steps.version.outputs.APK_ASSET_NAME }}
+        run: |
+          set -euo pipefail
+
+          echo "Publishing release to $GITHUB_REPOSITORY under tag $TAG..."
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists. Updating assets..."
+            gh release upload "$TAG" \
+              "release-assets/$ASSET_NAME" \
+              "release-assets/${ASSET_NAME}.sha256" \
+              --clobber
+          else
+            echo "Creating new GitHub Release: $TAG"
+            gh release create "$TAG" \
+              "release-assets/$ASSET_NAME" \
+              "release-assets/${ASSET_NAME}.sha256" \
+              --title "$TITLE" \
+              --notes-file release-notes.md
+          fi
+
+          echo "Release successfully published."
+
+      # 19. Commit updated central version state to app-release repository
+      - name: Commit updated central version state
+        shell: bash
+        working-directory: central-repo
+        env:
+          APP_ID: ${{ steps.version.outputs.APP_ID }}
+          APP_NAME: ${{ steps.version.outputs.APP_NAME }}
+          VERSION_NAME: ${{ steps.version.outputs.VERSION_NAME }}
+          BUILD_NUMBER: ${{ steps.version.outputs.BUILD_NUMBER }}
+          SOURCE_BRANCH: ${{ inputs.branch }}
+          SOURCE_COMMIT: ${{ steps.source_meta.outputs.COMMIT_SHA }}
+          RELEASE_TAG: ${{ steps.version.outputs.RELEASE_TAG }}
+        run: |
+          set -euo pipefail
+
+          echo "Recording successful release in central version-state.json..."
+          python scripts/manage_version.py record-success \
+            --app "$APP_ID" \
+            --version-name "$VERSION_NAME" \
+            --build-number "$BUILD_NUMBER" \
+            --branch "$SOURCE_BRANCH" \
+            --commit-sha "$SOURCE_COMMIT" \
+            --release-tag "$RELEASE_TAG" \
+            --state-file "version-state.json"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add version-state.json
+
+          if git diff --cached --quiet; then
+            echo "No version state changes to commit."
+            exit 0
+          fi
+
+          git commit -m "chore(release): bump $APP_NAME to $VERSION_NAME+$BUILD_NUMBER ($SOURCE_BRANCH) [skip ci]"
+
+          echo "Pushing updated version state to central repository..."
+          for attempt in 1 2 3; do
+            git pull --rebase origin main
+            if git push origin main; then
+              echo "Version state successfully committed and pushed to central repository."
+              break
+            fi
+
+            if [[ "$attempt" -eq 3 ]]; then
+              echo "::error::Failed to push version state after 3 attempts."
+              exit 1
+            fi
+
+            echo "Push conflict or failure, retrying in 5 seconds..."
+            sleep 5
+          done

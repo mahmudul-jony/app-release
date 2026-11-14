@@ -1,0 +1,40 @@
+name: System Validation
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'scripts/**'
+      - 'version-state.json'
+      - 'schema/**'
+      - '.github/workflows/**'
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  validate:
+    name: Validate Scripts & State
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout app-release
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test dependencies
+        run: |
+          pip install ruamel.yaml
+
+      - name: Run manage_version unit tests
+        run: |
+          python -m unittest discover -s scripts -p "test_*.py" -v
+
+      - name: Validate version-state.json
+        run: |
+          python scripts/manage_version.py validate-state --state-file version-state.json

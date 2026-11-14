@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.tmp
+
+# Environment / local outputs
+.env
+version.env
+release-assets/
+build/
+*.apk
+*.sha256
+
+# IDE / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
