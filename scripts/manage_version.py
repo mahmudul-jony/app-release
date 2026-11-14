@@ -1,27 +1,34 @@
 #!/usr/bin/env python3
 """
-Centralized Version Management Script for Flutter APK Releases.
+Centralized Version & Channel Management Script for Multi-Application Flutter APK Releases.
 
-Handles:
-  1. Reading and validating central version state.
-  2. Calculating next version names and build numbers according to branch rules:
+Supports:
+  1. Managing central version state for multiple applications.
+  2. Distinct release channels:
+     - 'main' branch        -> 'production' channel (prerelease: false)
+     - 'development' branch -> 'development' channel (prerelease: true)
+  3. Strict version progression rules:
      - 'development': patch version +1, build number +1
-     - 'main': version name unchanged, build number +1
-  3. Exporting calculated variables to GitHub Actions environment.
-  4. Updating fetched source pubspec.yaml before build (without committing to source repo).
-  5. Committing new version state after successful release publication.
+     - 'main'       : version name unchanged, build number +1
+  4. Monotonic build number enforcement (Android versionCode must always increase).
+  5. Applying versions to fetched source pubspec.yaml in runner memory (never committed to source repo).
+  6. Generating machine-readable release-metadata.json for unauthenticated client discovery.
+  7. Recording channel releases in central state after successful publication.
 """
 
 from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import sys
 from typing import Any, Dict, Tuple
+
+CENTRAL_REPO = "mahmudul-jony/app-release"
 
 
 def parse_semver(version_str: str) -> Tuple[int, int, int]:
@@ -39,6 +46,59 @@ def bump_patch(version_str: str) -> str:
     """Increment the patch component of a semantic version string (X.Y.Z -> X.Y.Z+1)."""
     major, minor, patch = parse_semver(version_str)
     return f"{major}.{minor}.{patch + 1}"
+
+
+def resolve_channel(branch: str) -> Tuple[str, bool]:
+    """
+    Resolve branch into release channel and prerelease flag.
+    'main'        -> ('production', False)
+    'development' -> ('development', True)
+    """
+    branch_clean = branch.strip().lower()
+    if branch_clean == "main":
+        return "production", False
+    elif branch_clean == "development":
+        return "development", True
+    else:
+        raise ValueError(
+            f"Unsupported branch '{branch}'. Central release supports only 'development' and 'main'."
+        )
+
+
+def calculate_next_version(
+    current_version_name: str,
+    current_build_number: int,
+    branch: str,
+) -> Tuple[str, int]:
+    """
+    Calculate next version name and build number based on source branch rules:
+
+    - 'development':
+      1. Increase patch portion of centrally stored version name by one.
+      2. Increase centrally stored build number by one.
+    - 'main':
+      1. Keep latest centrally stored version name unchanged.
+      2. Increase centrally stored build number by one.
+    """
+    parse_semver(current_version_name)
+    if not isinstance(current_build_number, int) or current_build_number < 1:
+        raise ValueError(
+            f"Current build number must be a positive integer, got: {current_build_number}"
+        )
+
+    branch_norm = branch.strip().lower()
+
+    if branch_norm == "development":
+        next_version_name = bump_patch(current_version_name)
+    elif branch_norm == "main":
+        next_version_name = current_version_name.strip()
+    else:
+        raise ValueError(
+            f"Unsupported branch '{branch}'. Central release supports only 'development' and 'main'."
+        )
+
+    next_build_number = current_build_number + 1
+    return next_version_name, next_build_number
 
 
 def load_state(state_file: Path) -> Dict[str, Any]:
@@ -64,43 +124,8 @@ def save_state(state_file: Path, data: Dict[str, Any]) -> None:
     temp_file.replace(state_file)
 
 
-def calculate_next_version(
-    current_version_name: str,
-    current_build_number: int,
-    branch: str,
-) -> Tuple[str, int]:
-    """
-    Calculate the next version name and build number based on source branch rules:
-
-    - 'development':
-      1. Increase patch portion of centrally stored version name by one.
-      2. Increase centrally stored build number by one.
-    - 'main':
-      1. Keep latest centrally stored version name unchanged.
-      2. Increase centrally stored build number by one.
-    """
-    # Validate current values
-    parse_semver(current_version_name)
-    if not isinstance(current_build_number, int) or current_build_number < 1:
-        raise ValueError(f"Current build number must be a positive integer, got: {current_build_number}")
-
-    branch_norm = branch.strip().lower()
-
-    if branch_norm == "development":
-        next_version_name = bump_patch(current_version_name)
-    elif branch_norm == "main":
-        next_version_name = current_version_name.strip()
-    else:
-        raise ValueError(
-            f"Unsupported branch '{branch}'. Central release only supports 'development' and 'main'."
-        )
-
-    next_build_number = current_build_number + 1
-    return next_version_name, next_build_number
-
-
 def write_github_output(outputs: Dict[str, str]) -> None:
-    """Write outputs to GITHUB_OUTPUT environment file if available."""
+    """Write outputs to GITHUB_OUTPUT and GITHUB_ENV environment files."""
     github_output_path = os.getenv("GITHUB_OUTPUT")
     if github_output_path:
         with open(github_output_path, "a", encoding="utf-8") as f:
@@ -115,7 +140,7 @@ def write_github_output(outputs: Dict[str, str]) -> None:
 
 
 def cmd_calculate(args: argparse.Namespace) -> None:
-    """Calculate next version and export workflow outputs."""
+    """Calculate next version, identify channel, and export workflow outputs."""
     state_path = Path(args.state_file).resolve()
     data = load_state(state_path)
 
@@ -129,7 +154,10 @@ def cmd_calculate(args: argparse.Namespace) -> None:
     current_ver = str(app_config.get("current_version_name", "1.0.0"))
     current_build = int(app_config.get("current_build_number", 1))
 
-    next_ver, next_build = calculate_next_version(current_ver, current_build, args.branch)
+    branch_clean = args.branch.strip().lower()
+    channel, is_prerelease = resolve_channel(branch_clean)
+
+    next_ver, next_build = calculate_next_version(current_ver, current_build, branch_clean)
 
     app_name = app_config.get("app_name", args.app.title())
     repository = app_config.get("repository", f"mahmudul-jony/{args.app}")
@@ -138,11 +166,11 @@ def cmd_calculate(args: argparse.Namespace) -> None:
     flutter_channel = app_config.get("flutter_channel", "stable")
     java_version = app_config.get("java_version", "17")
 
-    branch_clean = args.branch.strip().lower()
     version_full = f"{next_ver}+{next_build}"
-    release_tag = f"{app_id}-v{version_full}-{branch_clean}"
-    release_title = f"{app_name} v{version_full} ({branch_clean})"
-    apk_asset_name = f"{app_id}-v{version_full}-{branch_clean}.apk"
+    release_tag = f"{app_id}-v{version_full}-{channel}"
+    release_title = f"{app_name} v{version_full} ({channel.title()})"
+    apk_asset_name = f"{app_id}-v{version_full}-{channel}.apk"
+    metadata_asset_name = f"{app_id}-v{version_full}-{channel}-metadata.json"
 
     outputs = {
         "APP_ID": app_id,
@@ -157,9 +185,12 @@ def cmd_calculate(args: argparse.Namespace) -> None:
         "BUILD_NUMBER": str(next_build),
         "VERSION_CODE": str(next_build),
         "VERSION_FULL": version_full,
+        "CHANNEL": channel,
+        "IS_PRERELEASE": "true" if is_prerelease else "false",
         "RELEASE_TAG": release_tag,
         "RELEASE_TITLE": release_title,
         "APK_ASSET_NAME": apk_asset_name,
+        "METADATA_ASSET_NAME": metadata_asset_name,
         "SOURCE_BRANCH": branch_clean,
         "FLUTTER_VERSION": str(flutter_version),
         "FLUTTER_CHANNEL": str(flutter_channel),
@@ -171,16 +202,20 @@ def cmd_calculate(args: argparse.Namespace) -> None:
     if args.json:
         print(json.dumps(outputs, indent=2))
     else:
-        print(f"=== Version Calculation for {app_name} ===")
-        print(f"Source Branch       : {branch_clean}")
-        print(f"Current Version     : {current_ver}+{current_build}")
-        print(f"Calculated Version  : {version_full}")
-        print(f"Release Tag         : {release_tag}")
-        print(f"Release Title       : {release_title}")
-        print(f"Target APK Asset    : {apk_asset_name}")
-        print(f"Source Repository   : {repository}")
-        print(f"Expected Package    : {package_name}")
-        print(f"Flutter / Java      : Flutter {flutter_version} ({flutter_channel}) / Java {java_version}")
+        print(f"=== Central Release Calculation ===")
+        print(f"Application Identifier : {app_id}")
+        print(f"Application Name       : {app_name}")
+        print(f"Source Branch          : {branch_clean}")
+        print(f"Release Channel        : {channel} (is_prerelease: {is_prerelease})")
+        print(f"Current Central State  : {current_ver}+{current_build}")
+        print(f"Calculated Version     : {version_full}")
+        print(f"Release Tag            : {release_tag}")
+        print(f"Release Title          : {release_title}")
+        print(f"Target APK Asset       : {apk_asset_name}")
+        print(f"Metadata Asset         : {metadata_asset_name}")
+        print(f"Source Repository      : {repository}")
+        print(f"Target Package ID      : {package_name}")
+        print(f"Flutter / Java         : Flutter {flutter_version} ({flutter_channel}) / Java {java_version}")
 
 
 def cmd_apply_to_source(args: argparse.Namespace) -> None:
@@ -214,20 +249,75 @@ def cmd_apply_to_source(args: argparse.Namespace) -> None:
             new_lines.append(line)
 
     if not updated:
-        raise ValueError(
-            f"No 'version:' field found in {pubspec_path} to update."
-        )
+        raise ValueError(f"No 'version:' field found in {pubspec_path} to update.")
 
     pubspec_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
 
-    print(f"Applied version to source pubspec.yaml:")
-    print(f"  Previous: {old_version}")
-    print(f"  Updated : {target_version_line}")
-    print(f"  File    : {pubspec_path}")
+    print("Applied version to source pubspec.yaml:")
+    print(f"  Previous : {old_version}")
+    print(f"  Updated  : {target_version_line}")
+    print(f"  Target   : {pubspec_path}")
+
+
+def cmd_generate_metadata(args: argparse.Namespace) -> None:
+    """Generate machine-readable release metadata JSON file for public client discovery."""
+    apk_path = Path(args.apk_path).resolve()
+    if not apk_path.is_file():
+        raise FileNotFoundError(f"APK file not found: {apk_path}")
+
+    apk_size = apk_path.stat().st_size
+    with open(apk_path, "rb") as f:
+        sha256 = hashlib.sha256(f.read()).hexdigest()
+
+    channel, is_prerelease = resolve_channel(args.branch)
+    version_full = f"{args.version_name}+{args.build_number}"
+
+    download_base = f"https://github.com/{CENTRAL_REPO}/releases/download/{args.release_tag}"
+    apk_download_url = f"{download_base}/{args.apk_asset_name}"
+    sha256_download_url = f"{download_base}/{args.apk_asset_name}.sha256"
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    metadata = {
+        "schema_version": 1,
+        "app_id": args.app,
+        "app_name": args.app_name,
+        "package_name": args.package_name,
+        "version_name": args.version_name,
+        "build_number": int(args.build_number),
+        "version_full": version_full,
+        "channel": channel,
+        "is_prerelease": is_prerelease,
+        "source_branch": args.branch,
+        "source_commit_sha": args.commit_sha,
+        "release_tag": args.release_tag,
+        "release_title": args.release_title,
+        "published_at": now_iso,
+        "apk": {
+            "asset_name": args.apk_asset_name,
+            "download_url": apk_download_url,
+            "sha256": sha256,
+            "sha256_download_url": sha256_download_url,
+            "size_bytes": apk_size,
+        },
+    }
+
+    out_file = Path(args.output_file).resolve()
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_file, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+        f.write("\n")
+
+    print(f"Generated public release metadata at {out_file}:")
+    print(f"  App ID       : {args.app}")
+    print(f"  Channel      : {channel}")
+    print(f"  Version      : {version_full}")
+    print(f"  APK SHA-256  : {sha256}")
+    print(f"  Download URL : {apk_download_url}")
 
 
 def cmd_record_success(args: argparse.Namespace) -> None:
-    """Record successful release in the central version state file."""
+    """Record successful release in the central version state file with channel tracking."""
     state_path = Path(args.state_file).resolve()
     data = load_state(state_path)
 
@@ -242,17 +332,42 @@ def cmd_record_success(args: argparse.Namespace) -> None:
     if new_build <= current_build:
         raise ValueError(
             f"Cannot update state: New build number ({new_build}) must be strictly greater than "
-            f"current build number ({current_build}). Decreasing or reusing build numbers is prohibited."
+            f"current build number ({current_build}). Monotonic build numbers required."
         )
 
     parse_semver(args.version_name)
 
+    channel, is_prerelease = resolve_channel(args.branch)
     now_iso = datetime.now(timezone.utc).isoformat()
 
+    download_base = f"https://github.com/{CENTRAL_REPO}/releases/download/{args.release_tag}"
+    apk_download_url = f"{download_base}/{args.apk_asset_name}"
+    sha256_download_url = f"{download_base}/{args.apk_asset_name}.sha256"
+
+    # 1. Update overall central version and build number
     app_config["current_version_name"] = args.version_name
     app_config["current_build_number"] = new_build
     app_config["updated_at"] = now_iso
+
+    # 2. Update channel-specific record
+    if "channels" not in app_config:
+        app_config["channels"] = {}
+
+    app_config["channels"][channel] = {
+        "channel": channel,
+        "version_name": args.version_name,
+        "build_number": new_build,
+        "release_tag": args.release_tag,
+        "apk_asset_name": args.apk_asset_name,
+        "apk_download_url": apk_download_url,
+        "sha256_download_url": sha256_download_url,
+        "commit_sha": args.commit_sha,
+        "published_at": now_iso,
+    }
+
+    # 3. Update last_build metadata
     app_config["last_build"] = {
+        "channel": channel,
         "branch": args.branch,
         "commit_sha": args.commit_sha,
         "version_name": args.version_name,
@@ -263,12 +378,14 @@ def cmd_record_success(args: argparse.Namespace) -> None:
 
     save_state(state_path, data)
 
-    print(f"Central version state updated successfully for '{app_id}':")
+    print(f"Central state successfully updated for '{app_id}':")
+    print(f"  Channel      : {channel}")
     print(f"  Version Name : {args.version_name}")
     print(f"  Build Number : {new_build}")
     print(f"  Branch       : {args.branch}")
     print(f"  Commit SHA   : {args.commit_sha}")
     print(f"  Release Tag  : {args.release_tag}")
+    print(f"  Download URL : {apk_download_url}")
     print(f"  Timestamp    : {now_iso}")
 
 
@@ -281,8 +398,10 @@ def cmd_validate_state(args: argparse.Namespace) -> None:
         "app_id",
         "app_name",
         "repository",
+        "package_name",
         "current_version_name",
         "current_build_number",
+        "channels",
     ]
 
     for app_id, app_cfg in data["apps"].items():
@@ -295,16 +414,21 @@ def cmd_validate_state(args: argparse.Namespace) -> None:
         if build_no < 1:
             raise ValueError(f"App '{app_id}' has non-positive build number: {build_no}")
 
+        if "channels" in app_cfg:
+            for ch in ["production", "development"]:
+                if ch not in app_cfg["channels"]:
+                    raise ValueError(f"App '{app_id}' missing channel '{ch}' in {state_path}")
+
     print(f"State file {state_path} is valid.")
     print(f"Configured apps: {list(data['apps'].keys())}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Centralized Release Version Manager")
+    parser = argparse.ArgumentParser(description="Centralized Release & Channel Manager")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # Subcommand: calculate
-    calc_parser = subparsers.add_parser("calculate", help="Calculate next version for app and branch")
+    calc_parser = subparsers.add_parser("calculate", help="Calculate next version and channel")
     calc_parser.add_argument("--app", required=True, help="App identifier (e.g. onewallet)")
     calc_parser.add_argument("--branch", required=True, help="Branch ('development' or 'main')")
     calc_parser.add_argument(
@@ -320,6 +444,23 @@ def main() -> None:
     apply_parser.add_argument("--version-name", required=True, help="Version name (e.g. 1.0.1)")
     apply_parser.add_argument("--build-number", required=True, type=int, help="Build number (e.g. 2)")
 
+    # Subcommand: generate-metadata
+    meta_parser = subparsers.add_parser(
+        "generate-metadata", help="Generate public release-metadata.json file"
+    )
+    meta_parser.add_argument("--app", required=True, help="App identifier")
+    meta_parser.add_argument("--app-name", required=True, help="Application name")
+    meta_parser.add_argument("--package-name", required=True, help="Package ID / Application ID")
+    meta_parser.add_argument("--version-name", required=True, help="Version name")
+    meta_parser.add_argument("--build-number", required=True, type=int, help="Build number")
+    meta_parser.add_argument("--branch", required=True, help="Source branch")
+    meta_parser.add_argument("--commit-sha", required=True, help="Source commit SHA")
+    meta_parser.add_argument("--release-tag", required=True, help="Release tag")
+    meta_parser.add_argument("--release-title", required=True, help="Release title")
+    meta_parser.add_argument("--apk-asset-name", required=True, help="APK asset filename")
+    meta_parser.add_argument("--apk-path", required=True, help="Path to signed APK")
+    meta_parser.add_argument("--output-file", required=True, help="Path to write metadata JSON")
+
     # Subcommand: record-success
     rec_parser = subparsers.add_parser(
         "record-success", help="Record successful build into central version-state.json"
@@ -330,6 +471,7 @@ def main() -> None:
     rec_parser.add_argument("--branch", required=True, help="Source branch used")
     rec_parser.add_argument("--commit-sha", required=True, help="Source commit SHA")
     rec_parser.add_argument("--release-tag", required=True, help="Release tag published")
+    rec_parser.add_argument("--apk-asset-name", required=True, help="APK asset name")
     rec_parser.add_argument(
         "--state-file", default="version-state.json", help="Path to version-state.json"
     )
@@ -346,6 +488,8 @@ def main() -> None:
         cmd_calculate(args)
     elif args.command == "apply-to-source":
         cmd_apply_to_source(args)
+    elif args.command == "generate-metadata":
+        cmd_generate_metadata(args)
     elif args.command == "record-success":
         cmd_record_success(args)
     elif args.command == "validate-state":

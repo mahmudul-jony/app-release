@@ -47,7 +47,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      # 3. Calculate next version and export variables
+      # 3. Calculate next version, channel, and export variables
       - name: Calculate version from central state
         id: version
         working-directory: central-repo
@@ -107,10 +107,11 @@ jobs:
           echo "BUILD_TIMESTAMP=$BUILD_TIME" >> "$GITHUB_OUTPUT"
           echo "Source Repository : ${{ steps.version.outputs.REPOSITORY }}"
           echo "Selected Branch   : ${{ inputs.branch }}"
+          echo "Release Channel   : ${{ steps.version.outputs.CHANNEL }}"
           echo "Source Commit SHA : $COMMIT_SHA"
           echo "Build Timestamp   : $BUILD_TIME"
 
-      # 7. Apply calculated version to fetched Flutter pubspec.yaml
+      # 7. Apply calculated version to fetched Flutter pubspec.yaml (runner memory only, never committed to source)
       - name: Apply version to source pubspec.yaml
         run: |
           python central-repo/scripts/manage_version.py apply-to-source \
@@ -223,13 +224,14 @@ jobs:
             sleep 20
           done
 
-      # 15. Validate APK existence, signature, and package name
-      - name: Validate release APK and signature
+      # 15. Validate APK existence, signature, package name, and prepare assets
+      - name: Validate release APK and prepare assets
         shell: bash
         env:
           EXPECTED_PACKAGE_NAME: ${{ steps.version.outputs.PACKAGE_NAME }}
           APK_PATH: "source-repo/build/app/outputs/flutter-apk/app-release.apk"
           ASSET_NAME: ${{ steps.version.outputs.APK_ASSET_NAME }}
+          METADATA_NAME: ${{ steps.version.outputs.METADATA_ASSET_NAME }}
         run: |
           set -euo pipefail
 
@@ -277,6 +279,21 @@ jobs:
           cp "$APK_PATH" "release-assets/$ASSET_NAME"
           (cd release-assets && sha256sum "$ASSET_NAME" > "${ASSET_NAME}.sha256")
 
+          # Generate machine-readable release metadata JSON
+          python central-repo/scripts/manage_version.py generate-metadata \
+            --app "${{ steps.version.outputs.APP_ID }}" \
+            --app-name "${{ steps.version.outputs.APP_NAME }}" \
+            --package-name "${{ steps.version.outputs.PACKAGE_NAME }}" \
+            --version-name "${{ steps.version.outputs.VERSION_NAME }}" \
+            --build-number "${{ steps.version.outputs.BUILD_NUMBER }}" \
+            --branch "${{ inputs.branch }}" \
+            --commit-sha "${{ steps.source_meta.outputs.COMMIT_SHA }}" \
+            --release-tag "${{ steps.version.outputs.RELEASE_TAG }}" \
+            --release-title "${{ steps.version.outputs.RELEASE_TITLE }}" \
+            --apk-asset-name "${{ steps.version.outputs.APK_ASSET_NAME }}" \
+            --apk-path "release-assets/$ASSET_NAME" \
+            --output-file "release-assets/$METADATA_NAME"
+
           echo "Prepared release assets in release-assets/:"
           ls -lh release-assets/
 
@@ -293,65 +310,74 @@ jobs:
       - name: Generate release notes
         shell: bash
         env:
+          APP_ID: ${{ steps.version.outputs.APP_ID }}
           APP_NAME: ${{ steps.version.outputs.APP_NAME }}
           VERSION_NAME: ${{ steps.version.outputs.VERSION_NAME }}
           BUILD_NUMBER: ${{ steps.version.outputs.BUILD_NUMBER }}
+          CHANNEL: ${{ steps.version.outputs.CHANNEL }}
           SOURCE_BRANCH: ${{ inputs.branch }}
           SOURCE_COMMIT: ${{ steps.source_meta.outputs.COMMIT_SHA }}
           BUILD_TIMESTAMP: ${{ steps.source_meta.outputs.BUILD_TIMESTAMP }}
           ASSET_NAME: ${{ steps.version.outputs.APK_ASSET_NAME }}
+          METADATA_NAME: ${{ steps.version.outputs.METADATA_ASSET_NAME }}
           PACKAGE_NAME: ${{ steps.version.outputs.PACKAGE_NAME }}
           REPOSITORY: ${{ steps.version.outputs.REPOSITORY }}
+          RELEASE_TAG: ${{ steps.version.outputs.RELEASE_TAG }}
         run: |
           cat > release-notes.md <<EOF
-          # $APP_NAME Release v${VERSION_NAME}+${BUILD_NUMBER} (${SOURCE_BRANCH})
+          # $APP_NAME Release v${VERSION_NAME}+${BUILD_NUMBER} (${CHANNEL^} Channel)
 
           Automated release built centrally by [app-release](https://github.com/${{ github.repository }}).
 
-          ## Release Metadata
-          - **Application:** $APP_NAME
-          - **Package ID:** \`$PACKAGE_NAME\`
+          ## Release Identification
+          - **Application Identifier:** \`$APP_ID\`
+          - **Application Name:** $APP_NAME
+          - **Package Identifier:** \`$PACKAGE_NAME\`
+          - **Release Channel:** \`$CHANNEL\` (Source branch: \`$SOURCE_BRANCH\`)
           - **Version Name:** \`$VERSION_NAME\`
           - **Build Number (versionCode):** \`$BUILD_NUMBER\`
+          - **Release Tag:** \`$RELEASE_TAG\`
           - **Source Repository:** [\`$REPOSITORY\`](https://github.com/$REPOSITORY)
-          - **Source Branch:** \`$SOURCE_BRANCH\`
-          - **Source Commit SHA:** [\`${SOURCE_COMMIT:0:7}\`](https://github.com/$REPOSITORY/commit/$SOURCE_COMMIT)
-          - **Commit Details:** \`$SOURCE_COMMIT\`
+          - **Source Commit SHA:** [\`${SOURCE_COMMIT:0:7}\`](https://github.com/$REPOSITORY/commit/$SOURCE_COMMIT) (\`$SOURCE_COMMIT\`)
           - **Build Timestamp:** \`$BUILD_TIMESTAMP\`
 
-          ## Release Assets
-          - \`$ASSET_NAME\` (Signed release APK)
-          - \`${ASSET_NAME}.sha256\` (SHA-256 Checksum)
+          ## Public Download Assets
+          - **Direct APK Download:** [\`$ASSET_NAME\`](https://github.com/${{ github.repository }}/releases/download/$RELEASE_TAG/$ASSET_NAME)
+          - **SHA-256 Checksum:** [\`${ASSET_NAME}.sha256\`](https://github.com/${{ github.repository }}/releases/download/$RELEASE_TAG/${ASSET_NAME}.sha256)
+          - **Machine-Readable Metadata:** [\`$METADATA_NAME\`](https://github.com/${{ github.repository }}/releases/download/$RELEASE_TAG/$METADATA_NAME)
+
+          *Note: This repository is public. All release assets and metadata can be downloaded directly without authentication.*
           EOF
 
           cat release-notes.md
 
-      # 18. Publish release to central app-release repository
+      # 18. Publish release to public app-release repository
       - name: Publish GitHub Release
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.version.outputs.RELEASE_TAG }}
           TITLE: ${{ steps.version.outputs.RELEASE_TITLE }}
-          ASSET_NAME: ${{ steps.version.outputs.APK_ASSET_NAME }}
+          IS_PRERELEASE: ${{ steps.version.outputs.IS_PRERELEASE }}
         run: |
           set -euo pipefail
 
-          echo "Publishing release to $GITHUB_REPOSITORY under tag $TAG..."
+          PRERELEASE_FLAG=""
+          if [[ "$IS_PRERELEASE" == "true" ]]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+
+          echo "Publishing release to $GITHUB_REPOSITORY under tag $TAG (prerelease: $IS_PRERELEASE)..."
 
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG already exists. Updating assets..."
-            gh release upload "$TAG" \
-              "release-assets/$ASSET_NAME" \
-              "release-assets/${ASSET_NAME}.sha256" \
-              --clobber
+            gh release upload "$TAG" release-assets/* --clobber
           else
-            echo "Creating new GitHub Release: $TAG"
-            gh release create "$TAG" \
-              "release-assets/$ASSET_NAME" \
-              "release-assets/${ASSET_NAME}.sha256" \
+            echo "Creating new GitHub Release: $TAG..."
+            gh release create "$TAG" release-assets/* \
               --title "$TITLE" \
-              --notes-file release-notes.md
+              --notes-file release-notes.md \
+              $PRERELEASE_FLAG
           fi
 
           echo "Release successfully published."
@@ -368,6 +394,7 @@ jobs:
           SOURCE_BRANCH: ${{ inputs.branch }}
           SOURCE_COMMIT: ${{ steps.source_meta.outputs.COMMIT_SHA }}
           RELEASE_TAG: ${{ steps.version.outputs.RELEASE_TAG }}
+          APK_ASSET_NAME: ${{ steps.version.outputs.APK_ASSET_NAME }}
         run: |
           set -euo pipefail
 
@@ -379,6 +406,7 @@ jobs:
             --branch "$SOURCE_BRANCH" \
             --commit-sha "$SOURCE_COMMIT" \
             --release-tag "$RELEASE_TAG" \
+            --apk-asset-name "$APK_ASSET_NAME" \
             --state-file "version-state.json"
 
           git config user.name "github-actions[bot]"

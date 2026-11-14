@@ -18,7 +18,8 @@
           "repository",
           "package_name",
           "current_version_name",
-          "current_build_number"
+          "current_build_number",
+          "channels"
         ],
         "properties": {
           "app_id": { "type": "string" },
@@ -37,9 +38,44 @@
           "flutter_channel": { "type": "string" },
           "java_version": { "type": "string" },
           "updated_at": { "type": ["string", "null"] },
+          "channels": {
+            "type": "object",
+            "required": ["production", "development"],
+            "properties": {
+              "production": {
+                "type": "object",
+                "properties": {
+                  "channel": { "type": "string" },
+                  "version_name": { "type": "string" },
+                  "build_number": { "type": "integer" },
+                  "release_tag": { "type": ["string", "null"] },
+                  "apk_asset_name": { "type": ["string", "null"] },
+                  "apk_download_url": { "type": ["string", "null"] },
+                  "sha256_download_url": { "type": ["string", "null"] },
+                  "commit_sha": { "type": ["string", "null"] },
+                  "published_at": { "type": ["string", "null"] }
+                }
+              },
+              "development": {
+                "type": "object",
+                "properties": {
+                  "channel": { "type": "string" },
+                  "version_name": { "type": "string" },
+                  "build_number": { "type": "integer" },
+                  "release_tag": { "type": ["string", "null"] },
+                  "apk_asset_name": { "type": ["string", "null"] },
+                  "apk_download_url": { "type": ["string", "null"] },
+                  "sha256_download_url": { "type": ["string", "null"] },
+                  "commit_sha": { "type": ["string", "null"] },
+                  "published_at": { "type": ["string", "null"] }
+                }
+              }
+            }
+          },
           "last_build": {
             "type": ["object", "null"],
             "properties": {
+              "channel": { "type": ["string", "null"] },
               "branch": { "type": ["string", "null"] },
               "commit_sha": { "type": ["string", "null"] },
               "version_name": { "type": ["string", "null"] },

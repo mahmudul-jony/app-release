@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Unit tests for manage_version.py
-Verifies version calculation rules, monotonicity, pubspec updating, and state persistence.
+Verifies version calculation rules, channel resolution, metadata generation, and state persistence.
 """
 
 import json
@@ -15,6 +15,7 @@ from manage_version import (
     calculate_next_version,
     load_state,
     parse_semver,
+    resolve_channel,
     save_state,
 )
 
@@ -34,6 +35,30 @@ class TestVersionManagement(unittest.TestCase):
                     "current_version_name": "1.0.0",
                     "current_build_number": 1,
                     "updated_at": "2026-11-15T00:00:00Z",
+                    "channels": {
+                        "production": {
+                            "channel": "production",
+                            "version_name": "1.0.0",
+                            "build_number": 1,
+                            "release_tag": None,
+                            "apk_asset_name": None,
+                            "apk_download_url": None,
+                            "sha256_download_url": None,
+                            "commit_sha": None,
+                            "published_at": None,
+                        },
+                        "development": {
+                            "channel": "development",
+                            "version_name": "1.0.0",
+                            "build_number": 1,
+                            "release_tag": None,
+                            "apk_asset_name": None,
+                            "apk_download_url": None,
+                            "sha256_download_url": None,
+                            "commit_sha": None,
+                            "published_at": None,
+                        },
+                    },
                     "last_build": None,
                 }
             },
@@ -59,30 +84,29 @@ class TestVersionManagement(unittest.TestCase):
         self.assertEqual(bump_patch("1.0.9"), "1.0.10")
         self.assertEqual(bump_patch("2.3.4"), "2.3.5")
 
+    def test_channel_resolution(self):
+        ch, prerelease = resolve_channel("main")
+        self.assertEqual(ch, "production")
+        self.assertFalse(prerelease)
+
+        ch_dev, prerelease_dev = resolve_channel("development")
+        self.assertEqual(ch_dev, "development")
+        self.assertTrue(prerelease_dev)
+
+        with self.assertRaises(ValueError):
+            resolve_channel("feature-branch")
+
     def test_development_branch_rules(self):
-        # development: patch +1, build +1
         next_ver, next_build = calculate_next_version("1.0.0", 1, "development")
         self.assertEqual(next_ver, "1.0.1")
         self.assertEqual(next_build, 2)
 
     def test_main_branch_rules(self):
-        # main: version name unchanged, build +1
         next_ver, next_build = calculate_next_version("1.0.2", 3, "main")
         self.assertEqual(next_ver, "1.0.2")
         self.assertEqual(next_build, 4)
 
     def test_official_specification_progression_table(self):
-        """
-        Verify the exact progression required by the specification:
-        | Build | Branch      | Version |
-        |---|---|---|
-        | Initial | —         | 1.0.0+1 |
-        | 1     | development | 1.0.1+2 |
-        | 2     | development | 1.0.2+3 |
-        | 3     | main        | 1.0.2+4 |
-        | 4     | main        | 1.0.2+5 |
-        | 5     | development | 1.0.3+6 |
-        """
         ver = "1.0.0"
         build = 1
 
@@ -105,18 +129,6 @@ class TestVersionManagement(unittest.TestCase):
         # Build 5: development
         ver, build = calculate_next_version(ver, build, "development")
         self.assertEqual(f"{ver}+{build}", "1.0.3+6")
-
-    def test_unsupported_branch(self):
-        with self.assertRaises(ValueError):
-            calculate_next_version("1.0.0", 1, "feature/login")
-
-    def test_monotonic_build_number_enforced(self):
-        data = load_state(self.state_file)
-        app = data["apps"]["onewallet"]
-        current_build = app["current_build_number"]
-
-        # Valid monotonic increase
-        self.assertGreater(current_build + 1, current_build)
 
     def test_apply_to_pubspec(self):
         dummy_pubspec = Path(self.test_dir) / "pubspec.yaml"
@@ -145,10 +157,47 @@ class TestVersionManagement(unittest.TestCase):
         content = dummy_pubspec.read_text(encoding="utf-8")
         self.assertIn("version: 1.0.1+2", content)
 
+    def test_generate_metadata(self):
+        dummy_apk = Path(self.test_dir) / "app.apk"
+        dummy_apk.write_bytes(b"dummy apk content")
+        out_meta = Path(self.test_dir) / "metadata.json"
+
+        import subprocess
+        import sys
+
+        cmd = [
+            sys.executable,
+            str(Path(__file__).parent / "manage_version.py"),
+            "generate-metadata",
+            "--app", "onewallet",
+            "--app-name", "Onewallet",
+            "--package-name", "com.example.financeapp",
+            "--version-name", "1.0.1",
+            "--build-number", "2",
+            "--branch", "development",
+            "--commit-sha", "abcdef123456",
+            "--release-tag", "onewallet-v1.0.1+2-development",
+            "--release-title", "Onewallet v1.0.1+2 (Development)",
+            "--apk-asset-name", "onewallet-v1.0.1+2-development.apk",
+            "--apk-path", str(dummy_apk),
+            "--output-file", str(out_meta),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        with open(out_meta, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        self.assertEqual(data["app_id"], "onewallet")
+        self.assertEqual(data["channel"], "development")
+        self.assertTrue(data["is_prerelease"])
+        self.assertEqual(data["package_name"], "com.example.financeapp")
+        self.assertIn("download_url", data["apk"])
+
     def test_workflow_structure(self):
         workflow_path = Path(__file__).parent.parent / ".github" / "workflows" / "release.yml"
         self.assertTrue(workflow_path.is_file(), f"Workflow file not found: {workflow_path}")
-        
+
         from ruamel.yaml import YAML
         yaml = YAML(typ="safe")
         with open(workflow_path, "r", encoding="utf-8") as f:
@@ -171,7 +220,6 @@ class TestVersionManagement(unittest.TestCase):
 
         # 4. Repository write permissions
         self.assertEqual(data["permissions"]["contents"], "write")
-
 
 
 if __name__ == "__main__":
