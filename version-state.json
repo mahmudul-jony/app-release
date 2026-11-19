@@ -8,11 +8,11 @@
       "repository": "mahmudul-jony/Onewallet",
       "package_name": "com.example.onewallet",
       "current_version_name": "1.0.2",
-      "current_build_number": 3,
+      "current_build_number": 4,
       "flutter_version": "3.41.9",
       "flutter_channel": "stable",
       "java_version": "17",
-      "updated_at": "2026-11-19T19:44:31.672449+00:00",
+      "updated_at": "2026-11-19T19:52:26.829422+00:00",
       "channels": {
         "production": {
           "channel": "production",
@@ -48,7 +48,26 @@
         "built_at": "2026-11-19T19:44:31.672449+00:00",
         "status": "published"
       },
-      "active_reservation": null,
+      "active_reservation": {
+        "reservation_id": "onewallet-b4-run44602787148",
+        "run_id": "44602787148",
+        "run_attempt": 1,
+        "app_id": "onewallet",
+        "channel": "production",
+        "is_prerelease": false,
+        "branch": "main",
+        "version_name": "1.0.2",
+        "build_number": 4,
+        "version_full": "1.0.2+4",
+        "release_tag": "onewallet-v1.0.2+4-production",
+        "release_title": "Onewallet v1.0.2+4 (Production)",
+        "apk_asset_name": "onewallet-v1.0.2+4-production.apk",
+        "metadata_asset_name": "onewallet-v1.0.2+4-production-metadata.json",
+        "commit_sha": null,
+        "reserved_at": "2026-11-19T19:52:26.829422+00:00",
+        "status": "reserved",
+        "updated_at": "2026-11-19T19:52:26.829422+00:00"
+      },
       "reservations": [
         {
           "reservation_id": "onewallet-b2-run44596974652",
@@ -89,6 +108,26 @@
           "reserved_at": "2026-11-19T19:38:23.171311+00:00",
           "status": "published",
           "updated_at": "2026-11-19T19:44:31.672449+00:00"
+        },
+        {
+          "reservation_id": "onewallet-b4-run44602787148",
+          "run_id": "44602787148",
+          "run_attempt": 1,
+          "app_id": "onewallet",
+          "channel": "production",
+          "is_prerelease": false,
+          "branch": "main",
+          "version_name": "1.0.2",
+          "build_number": 4,
+          "version_full": "1.0.2+4",
+          "release_tag": "onewallet-v1.0.2+4-production",
+          "release_title": "Onewallet v1.0.2+4 (Production)",
+          "apk_asset_name": "onewallet-v1.0.2+4-production.apk",
+          "metadata_asset_name": "onewallet-v1.0.2+4-production-metadata.json",
+          "commit_sha": null,
+          "reserved_at": "2026-11-19T19:52:26.829422+00:00",
+          "status": "reserved",
+          "updated_at": "2026-11-19T19:52:26.829422+00:00"
         }
       ]
     }
