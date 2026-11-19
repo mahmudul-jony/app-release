@@ -418,24 +418,34 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.reserve-version.outputs.RELEASE_TAG }}
           TITLE: ${{ needs.reserve-version.outputs.RELEASE_TITLE }}
           IS_PRERELEASE: ${{ needs.reserve-version.outputs.IS_PRERELEASE }}
         run: |
           set -euo pipefail
+
+          # Ensure git context points to central-repo
+          git config --global --add safe.directory "$GITHUB_WORKSPACE/central-repo" || true
+          export GIT_DIR="$GITHUB_WORKSPACE/central-repo/.git"
+          export GIT_WORK_TREE="$GITHUB_WORKSPACE/central-repo"
+
+          TARGET_COMMIT="$(git -C central-repo rev-parse HEAD || echo "main")"
+          echo "Publishing release to $GH_REPO under tag $TAG (target: $TARGET_COMMIT, prerelease: $IS_PRERELEASE)..."
+
           PRERELEASE_FLAG=""
           if [[ "$IS_PRERELEASE" == "true" ]]; then
             PRERELEASE_FLAG="--prerelease"
           fi
 
-          echo "Publishing release to $GITHUB_REPOSITORY under tag $TAG (prerelease: $IS_PRERELEASE)..."
-
-          if gh release view "$TAG" >/dev/null 2>&1; then
+          if gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
             echo "Release $TAG already exists. Updating assets..."
-            gh release upload "$TAG" release-assets/* --clobber
+            gh release upload "$TAG" release-assets/* --repo "$GH_REPO" --clobber
           else
             echo "Creating new GitHub Release: $TAG..."
             gh release create "$TAG" release-assets/* \
+              --repo "$GH_REPO" \
+              --target "$TARGET_COMMIT" \
               --title "$TITLE" \
               --notes-file release-notes.md \
               $PRERELEASE_FLAG
