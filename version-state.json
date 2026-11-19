@@ -6,7 +6,7 @@
       "app_id": "onewallet",
       "app_name": "Onewallet",
       "repository": "mahmudul-jony/Onewallet",
-      "package_name": "com.example.financeapp",
+      "package_name": "com.example.onewallet",
       "current_version_name": "1.0.0",
       "current_build_number": 1,
       "flutter_version": "3.41.9",

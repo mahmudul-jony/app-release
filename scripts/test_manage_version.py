@@ -51,7 +51,7 @@ class TestVersionReservationAndConcurrency(unittest.TestCase):
                     "app_id": "onewallet",
                     "app_name": "Onewallet",
                     "repository": "mahmudul-jony/Onewallet",
-                    "package_name": "com.example.financeapp",
+                    "package_name": "com.example.onewallet",
                     "current_version_name": "1.0.0",
                     "current_build_number": 1,
                     "updated_at": "2026-11-15T00:00:00Z",
@@ -347,7 +347,7 @@ class TestVersionReservationAndConcurrency(unittest.TestCase):
         args = argparse.Namespace(
             app="onewallet",
             app_name="Onewallet",
-            package_name="com.example.financeapp",
+            package_name="com.example.onewallet",
             version_name="1.0.1",
             build_number=2,
             branch="development",
@@ -366,7 +366,7 @@ class TestVersionReservationAndConcurrency(unittest.TestCase):
         self.assertEqual(data["app_id"], "onewallet")
         self.assertEqual(data["channel"], "development")
         self.assertTrue(data["is_prerelease"])
-        self.assertEqual(data["package_name"], "com.example.financeapp")
+        self.assertEqual(data["package_name"], "com.example.onewallet")
         self.assertIn("download_url", data["apk"])
 
     def test_workflow_structure(self):

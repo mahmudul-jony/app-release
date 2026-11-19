@@ -230,16 +230,19 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p android/app
-          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/app/upload-keystore.jks
-          cp android/app/upload-keystore.jks android/upload-keystore.jks
+          # Decode keystore file into onewallet-keystore.jks and upload-keystore.jks for universal compatibility
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/app/onewallet-keystore.jks
+          cp android/app/onewallet-keystore.jks android/onewallet-keystore.jks
+          cp android/app/onewallet-keystore.jks android/app/upload-keystore.jks
+          cp android/app/onewallet-keystore.jks android/upload-keystore.jks
 
-          KEY_ALIAS="${ANDROID_KEY_ALIAS:-upload}"
+          KEY_ALIAS="${ANDROID_KEY_ALIAS:-onewallet}"
 
           cat > android/key.properties <<EOF
           storePassword=$ANDROID_KEYSTORE_PASSWORD
           keyPassword=$ANDROID_KEY_PASSWORD
           keyAlias=$KEY_ALIAS
-          storeFile=upload-keystore.jks
+          storeFile=onewallet-keystore.jks
           EOF
 
           echo "Android release signing configured with key alias: $KEY_ALIAS"
