@@ -33,7 +33,10 @@ from manage_version import (
     cmd_generate_metadata,
     cmd_record_failure,
     cmd_reserve,
+    compare_semver,
     load_state,
+    parse_pubspec_file,
+    parse_pubspec_text,
     parse_semver,
     resolve_channel,
     save_state,
@@ -93,7 +96,14 @@ class TestVersionReservationAndConcurrency(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.test_dir)
 
-    def _reserve(self, app="onewallet", branch="development", run_id="run-1", state_file=None):
+    def _reserve(
+        self,
+        app="onewallet",
+        branch="development",
+        run_id="run-1",
+        state_file=None,
+        source_pubspec=None,
+    ):
         sf = state_file or self.state_file
         args = argparse.Namespace(
             app=app,
@@ -101,6 +111,7 @@ class TestVersionReservationAndConcurrency(unittest.TestCase):
             run_id=run_id,
             run_attempt=1,
             commit_sha=None,
+            source_pubspec=source_pubspec,
             state_file=str(sf),
             json=False,
         )
@@ -380,6 +391,77 @@ class TestVersionReservationAndConcurrency(unittest.TestCase):
 
         self.assertIn("workflow_dispatch", data[True] if True in data else data["on"])
         self.assertEqual(data["permissions"]["contents"], "write")
+
+    def test_compare_semver(self):
+        self.assertEqual(compare_semver("1.0.13", "1.0.5"), 1)
+        self.assertEqual(compare_semver("1.0.5", "1.0.13"), -1)
+        self.assertEqual(compare_semver("1.0.13", "1.0.13"), 0)
+        self.assertEqual(compare_semver("2.0.0", "1.99.99"), 1)
+
+    def test_parse_pubspec_text(self):
+        text = "name: onewallet\nversion: 1.0.13+15\nenvironment:\n  sdk: ^3.0.0"
+        parsed = parse_pubspec_text(text)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed, ("1.0.13", 15))
+
+        text_no_build = "name: onewallet\nversion: 1.2.3\n"
+        self.assertEqual(parse_pubspec_text(text_no_build), ("1.2.3", 1))
+
+    def test_reserve_with_source_pubspec_development_ahead(self):
+        # Initial state is 1.0.0+1
+        pubspec_file = Path(self.test_dir) / "source_pubspec.yaml"
+        pubspec_file.write_text("name: onewallet\nversion: 1.0.13+15\n", encoding="utf-8")
+
+        res = self._reserve(
+            app="onewallet",
+            branch="development",
+            run_id="run-sync-dev",
+            source_pubspec=str(pubspec_file),
+        )
+        # Development policy: bumps patch (+1) and build (+1) from 1.0.13+15 -> 1.0.14+16
+        self.assertEqual(res["version_name"], "1.0.14")
+        self.assertEqual(res["build_number"], 16)
+        self.assertEqual(res["version_full"], "1.0.14+16")
+        self.assertEqual(res["channel"], "development")
+
+    def test_reserve_with_source_pubspec_main_ahead(self):
+        # Initial state is 1.0.0+1
+        pubspec_file = Path(self.test_dir) / "source_pubspec.yaml"
+        pubspec_file.write_text("name: onewallet\nversion: 1.0.13+15\n", encoding="utf-8")
+
+        res = self._reserve(
+            app="onewallet",
+            branch="main",
+            run_id="run-sync-main",
+            source_pubspec=str(pubspec_file),
+        )
+        # Main policy: keeps version name unchanged, bumps build (+1) from 1.0.13+15 -> 1.0.13+16
+        self.assertEqual(res["version_name"], "1.0.13")
+        self.assertEqual(res["build_number"], 16)
+        self.assertEqual(res["version_full"], "1.0.13+16")
+        self.assertEqual(res["channel"], "production")
+
+    def test_reserve_with_source_pubspec_behind_does_not_regress(self):
+        # Advance central state to 1.0.13+15 first
+        state = load_state(self.state_file)
+        state["apps"]["onewallet"]["current_version_name"] = "1.0.13"
+        state["apps"]["onewallet"]["current_build_number"] = 15
+        save_state(self.state_file, state)
+
+        # Source pubspec is older: 1.0.5+7
+        pubspec_file = Path(self.test_dir) / "source_pubspec.yaml"
+        pubspec_file.write_text("name: onewallet\nversion: 1.0.5+7\n", encoding="utf-8")
+
+        res = self._reserve(
+            app="onewallet",
+            branch="development",
+            run_id="run-sync-older",
+            source_pubspec=str(pubspec_file),
+        )
+        # Must NOT regress to 1.0.6+8; must progress from 1.0.13+15 -> 1.0.14+16
+        self.assertEqual(res["version_name"], "1.0.14")
+        self.assertEqual(res["build_number"], 16)
+        self.assertEqual(res["version_full"], "1.0.14+16")
 
 
 if __name__ == "__main__":

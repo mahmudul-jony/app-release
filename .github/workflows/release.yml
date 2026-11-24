@@ -90,9 +90,39 @@ jobs:
           fi
           echo "All required secrets verified."
 
+      - name: Fetch target branch pubspec.yaml from source repository
+        shell: bash
+        env:
+          SOURCE_REPO_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "Fetching target branch pubspec.yaml for ${{ inputs.app }} (${{ inputs.branch }})..."
+          REPO_NAME=$(python -c "import json; data=json.load(open('version-state.json')); print(data.get('apps', {}).get('${{ inputs.app }}', {}).get('repository', 'mahmudul-jony/Onewallet'))")
+          echo "Target repository: $REPO_NAME, branch: ${{ inputs.branch }}"
+
+          TEMP_PUBSPEC="$RUNNER_TEMP/source_pubspec.yaml"
+          rm -f "$TEMP_PUBSPEC"
+
+          HTTP_STATUS=$(curl -s -w "%{http_code}" -o "$TEMP_PUBSPEC" \
+            -H "Authorization: Bearer $SOURCE_REPO_TOKEN" \
+            -H "User-Agent: app-release-workflow" \
+            -H "Accept: application/vnd.github.raw" \
+            "https://api.github.com/repos/$REPO_NAME/contents/pubspec.yaml?ref=${{ inputs.branch }}")
+
+          if [ "$HTTP_STATUS" -eq 200 ] && [ -s "$TEMP_PUBSPEC" ]; then
+            echo "Successfully fetched source pubspec.yaml (HTTP 200)."
+            grep -E "^version:" "$TEMP_PUBSPEC" || true
+            echo "SOURCE_PUBSPEC_ARG=--source-pubspec $TEMP_PUBSPEC" >> "$GITHUB_ENV"
+          else
+            echo "::warning::Could not fetch pubspec.yaml via curl (HTTP $HTTP_STATUS). Relying on central state / Python fallback."
+            echo "SOURCE_PUBSPEC_ARG=" >> "$GITHUB_ENV"
+          fi
+
       - name: Atomically reserve and persist build number
         id: reserve
         shell: bash
+        env:
+          SOURCE_REPO_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -111,7 +141,8 @@ jobs:
               --branch "${{ inputs.branch }}" \
               --run-id "${{ github.run_id }}" \
               --run-attempt "${{ github.run_attempt }}" \
-              --state-file "version-state.json"
+              --state-file "version-state.json" \
+              $SOURCE_PUBSPEC_ARG
 
             git add version-state.json
 

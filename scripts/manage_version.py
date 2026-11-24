@@ -21,6 +21,7 @@ Handles:
 from __future__ import annotations
 
 import argparse
+import base64
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -29,6 +30,8 @@ from pathlib import Path
 import re
 import sys
 from typing import Any, Dict, Optional, Tuple
+import urllib.error
+import urllib.request
 
 CENTRAL_REPO = "mahmudul-jony/app-release"
 MAX_RESERVATIONS_HISTORY = 50
@@ -43,6 +46,77 @@ def parse_semver(version_str: str) -> Tuple[int, int, int]:
             f"Invalid semantic version '{version_str}'. Expected format: MAJOR.MINOR.PATCH (e.g. 1.0.0)"
         )
     return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+
+def compare_semver(v1: str, v2: str) -> int:
+    """Compare two semantic versions. Returns -1 if v1 < v2, 1 if v1 > v2, 0 if equal."""
+    t1 = parse_semver(v1)
+    t2 = parse_semver(v2)
+    if t1 < t2:
+        return -1
+    elif t1 > t2:
+        return 1
+    return 0
+
+
+def parse_pubspec_text(content: str) -> Optional[Tuple[str, int]]:
+    """Parse version name and build number from pubspec text (e.g. 'version: 1.0.13+15')."""
+    for line in content.splitlines():
+        match = re.match(r"^\s*version\s*:\s*([0-9]+\.[0-9]+\.[0-9]+)(?:\+([0-9]+))?", line.strip())
+        if match:
+            ver_name = match.group(1)
+            build_num = int(match.group(2)) if match.group(2) else 1
+            return ver_name, build_num
+    return None
+
+
+def parse_pubspec_file(pubspec_path: Path) -> Optional[Tuple[str, int]]:
+    """Parse version name and build number from a local pubspec.yaml file or JSON API payload."""
+    if not pubspec_path.is_file():
+        return None
+    try:
+        raw = pubspec_path.read_text(encoding="utf-8")
+        if raw.strip().startswith("{") and '"content":' in raw:
+            try:
+                data = json.loads(raw)
+                if "content" in data and data.get("encoding") == "base64":
+                    raw = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+            except Exception:
+                pass
+        return parse_pubspec_text(raw)
+    except Exception as e:
+        print(f"Notice: Failed to read pubspec at {pubspec_path}: {e}")
+        return None
+
+
+def fetch_pubspec_from_api(
+    repository: str,
+    branch: str,
+    token: Optional[str] = None,
+) -> Optional[Tuple[str, int]]:
+    """Fetch pubspec.yaml from GitHub API directly if network/token is available."""
+    url = f"https://api.github.com/repos/{repository}/contents/pubspec.yaml?ref={branch}"
+    req = urllib.request.Request(url)
+    req.add_header("User-Agent", "app-release-manage-version")
+    req.add_header("Accept", "application/vnd.github.raw")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = resp.read()
+            text = data.decode("utf-8", errors="replace")
+            if text.strip().startswith("{") and '"content":' in text:
+                try:
+                    payload = json.loads(text)
+                    if "content" in payload and payload.get("encoding") == "base64":
+                        text = base64.b64decode(payload["content"]).decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+            return parse_pubspec_text(text)
+    except Exception as e:
+        print(f"Notice: Could not fetch pubspec from API ({repository}@{branch}): {e}")
+        return None
 
 
 def bump_patch(version_str: str) -> str:
@@ -192,14 +266,47 @@ def cmd_reserve(args: argparse.Namespace) -> Dict[str, Any]:
             write_github_output(outputs)
             return res
 
-    # 2. Calculate next version and build number
+    # 2. Resolve base version and build number from central state and source pubspec
     current_ver = str(app_config.get("current_version_name", "1.0.0"))
     current_build = int(app_config.get("current_build_number", 1))
+    repository = app_config.get("repository", f"mahmudul-jony/{args.app}")
+
+    source_ver = None
+    source_build = None
+
+    # Check 1: Explicit --source-pubspec file argument
+    if getattr(args, "source_pubspec", None):
+        pub_path = Path(args.source_pubspec).resolve()
+        parsed = parse_pubspec_file(pub_path)
+        if parsed:
+            source_ver, source_build = parsed
+            print(f"Loaded source pubspec from file: version={source_ver}+{source_build}")
+
+    # Check 2: Fetch via GitHub API if not found and token available
+    if not source_ver:
+        token = os.getenv("SOURCE_REPO_TOKEN") or os.getenv("GITHUB_TOKEN")
+        if token and repository:
+            parsed = fetch_pubspec_from_api(repository, branch_clean, token)
+            if parsed:
+                source_ver, source_build = parsed
+                print(f"Fetched source pubspec via API: version={source_ver}+{source_build}")
+
+    # Sync base with source pubspec if source is ahead
+    if source_ver is not None and source_build is not None:
+        if compare_semver(source_ver, current_ver) > 0:
+            print(
+                f"Advancing base version name from state '{current_ver}' to source '{source_ver}'"
+            )
+            current_ver = source_ver
+        if source_build > current_build:
+            print(
+                f"Advancing base build number from state {current_build} to source {source_build}"
+            )
+            current_build = source_build
 
     next_ver, next_build = calculate_next_version(current_ver, current_build, branch_clean)
 
     app_name = app_config.get("app_name", args.app.title())
-    repository = app_config.get("repository", f"mahmudul-jony/{args.app}")
     package_name = app_config.get("package_name", "")
     flutter_version = app_config.get("flutter_version", "3.41.9")
     flutter_channel = app_config.get("flutter_channel", "stable")
@@ -594,6 +701,9 @@ def main() -> None:
     res_parser.add_argument("--run-id", default=None, help="GitHub Actions run ID")
     res_parser.add_argument("--run-attempt", default=1, type=int, help="Run attempt number")
     res_parser.add_argument("--commit-sha", default=None, help="Source commit SHA if known")
+    res_parser.add_argument(
+        "--source-pubspec", default=None, help="Path to fetched source repo pubspec.yaml"
+    )
     res_parser.add_argument(
         "--state-file", default="version-state.json", help="Path to version-state.json"
     )
