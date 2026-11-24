@@ -12,7 +12,7 @@
       "flutter_version": "3.41.9",
       "flutter_channel": "stable",
       "java_version": "17",
-      "updated_at": "2026-11-24T07:02:32.593957+00:00",
+      "updated_at": "2026-11-24T07:09:02.916604+00:00",
       "channels": {
         "production": {
           "channel": "production",
@@ -28,47 +28,28 @@
         },
         "development": {
           "channel": "development",
-          "version_name": "1.0.4",
-          "build_number": 6,
-          "release_tag": "onewallet-v1.0.4+6-development",
-          "apk_asset_name": "onewallet-v1.0.4+6-development.apk",
-          "apk_download_url": "https://github.com/mahmudul-jony/app-release/releases/download/onewallet-v1.0.4+6-development/onewallet-v1.0.4+6-development.apk",
-          "sha256_download_url": "https://github.com/mahmudul-jony/app-release/releases/download/onewallet-v1.0.4+6-development/onewallet-v1.0.4+6-development.apk.sha256",
-          "commit_sha": "be2c3dad4da36168ec06924a3f504126db393e0a",
-          "published_at": "2026-11-20T14:30:05.217399+00:00",
-          "run_id": "44753052203"
+          "version_name": "1.0.5",
+          "build_number": 7,
+          "release_tag": "onewallet-v1.0.5+7-development",
+          "apk_asset_name": "onewallet-v1.0.5+7-development.apk",
+          "apk_download_url": "https://github.com/mahmudul-jony/app-release/releases/download/onewallet-v1.0.5+7-development/onewallet-v1.0.5+7-development.apk",
+          "sha256_download_url": "https://github.com/mahmudul-jony/app-release/releases/download/onewallet-v1.0.5+7-development/onewallet-v1.0.5+7-development.apk.sha256",
+          "commit_sha": "6d69eac4c426e9cb20357a5b8d0263f67d5f9978",
+          "published_at": "2026-11-24T07:09:02.916604+00:00",
+          "run_id": "45344906920"
         }
       },
       "last_build": {
         "channel": "development",
         "branch": "development",
-        "commit_sha": "be2c3dad4da36168ec06924a3f504126db393e0a",
-        "version_name": "1.0.4",
-        "build_number": 6,
-        "release_tag": "onewallet-v1.0.4+6-development",
-        "built_at": "2026-11-20T14:30:05.217399+00:00",
-        "status": "published"
-      },
-      "active_reservation": {
-        "reservation_id": "onewallet-b7-run45344906920",
-        "run_id": "45344906920",
-        "run_attempt": 1,
-        "app_id": "onewallet",
-        "channel": "development",
-        "is_prerelease": true,
-        "branch": "development",
+        "commit_sha": "6d69eac4c426e9cb20357a5b8d0263f67d5f9978",
         "version_name": "1.0.5",
         "build_number": 7,
-        "version_full": "1.0.5+7",
         "release_tag": "onewallet-v1.0.5+7-development",
-        "release_title": "Onewallet v1.0.5+7 (Development)",
-        "apk_asset_name": "onewallet-v1.0.5+7-development.apk",
-        "metadata_asset_name": "onewallet-v1.0.5+7-development-metadata.json",
-        "commit_sha": null,
-        "reserved_at": "2026-11-24T07:02:32.593957+00:00",
-        "status": "reserved",
-        "updated_at": "2026-11-24T07:02:32.593957+00:00"
+        "built_at": "2026-11-24T07:09:02.916604+00:00",
+        "status": "published"
       },
+      "active_reservation": null,
       "reservations": [
         {
           "reservation_id": "onewallet-b2-run44596974652",
@@ -185,10 +166,10 @@
           "release_title": "Onewallet v1.0.5+7 (Development)",
           "apk_asset_name": "onewallet-v1.0.5+7-development.apk",
           "metadata_asset_name": "onewallet-v1.0.5+7-development-metadata.json",
-          "commit_sha": null,
+          "commit_sha": "6d69eac4c426e9cb20357a5b8d0263f67d5f9978",
           "reserved_at": "2026-11-24T07:02:32.593957+00:00",
-          "status": "reserved",
-          "updated_at": "2026-11-24T07:02:32.593957+00:00"
+          "status": "published",
+          "updated_at": "2026-11-24T07:09:02.916604+00:00"
         }
       ]
     }
