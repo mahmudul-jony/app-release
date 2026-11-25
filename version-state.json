@@ -12,7 +12,7 @@
       "flutter_version": "3.41.9",
       "flutter_channel": "stable",
       "java_version": "17",
-      "updated_at": "2026-11-25T06:24:01.283424+00:00",
+      "updated_at": "2026-11-25T06:27:41.580502+00:00",
       "channels": {
         "production": {
           "channel": "production",
@@ -66,8 +66,8 @@
         "metadata_asset_name": "onewallet-v1.0.23+25-development-metadata.json",
         "commit_sha": null,
         "reserved_at": "2026-11-25T06:24:01.283424+00:00",
-        "status": "reserved",
-        "updated_at": "2026-11-25T06:24:01.283424+00:00"
+        "status": "failure",
+        "updated_at": "2026-11-25T06:27:41.580502+00:00"
       },
       "reservations": [
         {
@@ -265,10 +265,10 @@
           "release_title": "Onewallet v1.0.23+25 (Development)",
           "apk_asset_name": "onewallet-v1.0.23+25-development.apk",
           "metadata_asset_name": "onewallet-v1.0.23+25-development-metadata.json",
-          "commit_sha": null,
+          "commit_sha": "ee4bfd8dfbae752be787529b426da90961aa3328",
           "reserved_at": "2026-11-25T06:24:01.283424+00:00",
-          "status": "reserved",
-          "updated_at": "2026-11-25T06:24:01.283424+00:00"
+          "status": "failure",
+          "updated_at": "2026-11-25T06:27:41.580502+00:00"
         }
       ]
     }
