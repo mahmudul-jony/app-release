@@ -234,6 +234,36 @@ jobs:
           distribution: temurin
           java-version: ${{ needs.reserve-version.outputs.JAVA_VERSION }}
 
+      - name: Setup Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-home-cache-cleanup: true
+
+      - name: Configure Gradle Maven Central mirror
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.gradle/init.d"
+          cat > "$HOME/.gradle/init.d/maven-mirror.init.gradle.kts" <<'EOF'
+          gradle.beforeSettings {
+              pluginManagement {
+                  repositories {
+                      maven {
+                          url = uri("https://maven-central.storage-download.googleapis.com/maven2")
+                      }
+                      gradlePluginPortal()
+                  }
+              }
+              dependencyResolutionManagement {
+                  repositories {
+                      maven {
+                          url = uri("https://maven-central.storage-download.googleapis.com/maven2")
+                      }
+                  }
+              }
+          }
+          EOF
+          echo "Configured Gradle Maven Central mirror init script."
+
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
@@ -319,8 +349,9 @@ jobs:
               exit 1
             fi
 
-            echo "Build failed. Retrying in 20 seconds..."
-            sleep 20
+            RETRY_DELAY=$(( attempt * 30 ))
+            echo "Build failed. Retrying in ${RETRY_DELAY} seconds..."
+            sleep "$RETRY_DELAY"
           done
 
       - name: Validate release APK and prepare assets
